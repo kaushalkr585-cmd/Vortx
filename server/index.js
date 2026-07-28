@@ -283,14 +283,14 @@ app.get('/api/download', (req, res) => {
     );
   } else {
     // Extract target height if present and construct optional height matching selector
-    let targetFmt = 'bestvideo+bestaudio/best';
+    let targetFmt = 'bv*+ba/b';
     if (format) {
       const match = format.match(/height<=?\??(\d+)/);
       if (match && match[1]) {
         const h = match[1];
-        targetFmt = `bestvideo[height<=?${h}]+bestaudio/bestvideo+bestaudio/best`;
+        targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b`;
       } else {
-        targetFmt = `${format}/bestvideo+bestaudio/best`;
+        targetFmt = `${format}/bv*+ba/b`;
       }
     }
     console.log(`[DOWNLOAD] Resolved targetFmt: ${targetFmt}`);
