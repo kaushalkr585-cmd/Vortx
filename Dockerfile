@@ -18,9 +18,9 @@ RUN pip3 install --no-cache-dir --break-system-packages yt-dlp
 
 WORKDIR /app
 
-# Install frontend dependencies
+# Install frontend dependencies (including devDependencies like typescript and vite for build)
 COPY package*.json ./
-RUN npm ci --omit=dev || npm install
+RUN npm ci || npm install
 
 # Install server dependencies
 COPY server/package*.json ./server/
