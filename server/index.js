@@ -53,13 +53,25 @@ app.get('/api/info', async (req, res) => {
 
   console.log(`[INFO] Fetching metadata for: ${url}`);
 
+  const cookiesPath = [
+    path.join(__dirname, 'cookies.txt'),
+    path.join(__dirname, '../cookies.txt'),
+  ].find(p => fs.existsSync(p));
+
   const args = [
     '--no-playlist',
     '--no-warnings',
     '--dump-json',
     '--quiet',
-    url,
+    '--extractor-args', 'youtube:player_client=ios,mweb',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   ];
+
+  if (cookiesPath) {
+    args.push('--cookies', cookiesPath);
+  }
+
+  args.push(url);
 
   const proc = spawn('yt-dlp', args);
   let rawData = '';
@@ -210,7 +222,20 @@ app.get('/api/download', (req, res) => {
   const args = [
     '--no-playlist',
     '--no-warnings',
+    '--extractor-args', 'youtube:player_client=ios,mweb',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   ];
+
+  // Check for cookies file in root or server directory
+  const cookiesPath = [
+    path.join(__dirname, 'cookies.txt'),
+    path.join(__dirname, '../cookies.txt'),
+  ].find(p => fs.existsSync(p));
+
+  if (cookiesPath) {
+    console.log(`[DOWNLOAD] Using cookies file from: ${cookiesPath}`);
+    args.push('--cookies', cookiesPath);
+  }
 
   if (ffmpegPath) {
     args.push('--ffmpeg-location', ffmpegPath);
