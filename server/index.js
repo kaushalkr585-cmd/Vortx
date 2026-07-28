@@ -161,8 +161,8 @@ app.get('/api/info', async (req, res) => {
           : '—';
         const width = Math.round((height * 16) / 9);
 
-        // Format selector prioritizing MP4 video + M4A audio streams for clean FFmpeg merging
-        const fmt = `bestvideo[height<=${height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`;
+        // Universal format selector prioritizing requested resolution with automatic fallbacks
+        const fmt = `bv*[height<=${height}]+ba/bestvideo[height<=${height}]+bestaudio/b[height<=${height}]/bv*+ba/b/best`;
 
         return {
           id: fmt,
@@ -253,8 +253,9 @@ app.get('/api/download', (req, res) => {
 
   if (isAudio) {
     const quality = audioQuality || '2';
+    const audioFmt = format ? `${format}/bestaudio/ba/best` : 'bestaudio/ba/best';
     args.push(
-      '-f', format || 'bestaudio/best',
+      '-f', audioFmt,
       '--extract-audio',
       '--audio-format', 'mp3',
       '--audio-quality', quality,
@@ -262,8 +263,10 @@ app.get('/api/download', (req, res) => {
       url
     );
   } else {
-    // Clean mp4+m4a format selector with fallback
-    const targetFmt = format || 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best';
+    // Universal format selector with fallback chain
+    const targetFmt = format
+      ? `${format}/bv*+ba/b/best`
+      : 'bv*+ba/b/best';
     args.push(
       '-f', targetFmt,
       '--merge-output-format', 'mp4',
