@@ -162,7 +162,7 @@ app.get('/api/info', async (req, res) => {
         const width = Math.round((height * 16) / 9);
 
         // Universal format selector prioritizing requested resolution with automatic fallbacks
-        const fmt = `bv*[height<=${height}]+ba/bestvideo[height<=${height}]+bestaudio/b[height<=${height}]/bv*+ba/b/best`;
+        const fmt = `bv*[height<=${height}]+ba/b[height<=${height}]/bv*+ba/b/best`;
 
         return {
           id: fmt,
@@ -263,10 +263,18 @@ app.get('/api/download', (req, res) => {
       url
     );
   } else {
-    // Universal format selector with fallback chain
-    const targetFmt = format
-      ? `${format}/bv*+ba/b/best`
-      : 'bv*+ba/b/best';
+    // Extract target height if present, or construct 5-stage fallback format selector
+    let targetFmt = 'bv*+ba/b/best';
+    if (format) {
+      const match = format.match(/height<=?(\d+)/);
+      if (match && match[1]) {
+        const h = match[1];
+        targetFmt = `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b/best`;
+      } else {
+        targetFmt = `${format}/bv*+ba/b/best`;
+      }
+    }
+    console.log(`[DOWNLOAD] Resolved targetFmt: ${targetFmt}`);
     args.push(
       '-f', targetFmt,
       '--merge-output-format', 'mp4',
