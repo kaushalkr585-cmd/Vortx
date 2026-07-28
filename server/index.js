@@ -63,13 +63,29 @@ function getCookiesPath() {
   ].find(p => fs.existsSync(p)) || null;
 }
 
+// Helper function to sanitize YouTube URLs by removing playlist & mix tracking parameters
+function sanitizeUrl(rawUrl) {
+  if (!rawUrl) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.hostname.includes('youtube.com') && parsed.searchParams.has('v')) {
+      const videoId = parsed.searchParams.get('v');
+      return `https://www.youtube.com/watch?v=${videoId}`;
+    }
+  } catch (e) {
+    // If URL parsing fails, return raw string
+  }
+  return rawUrl;
+}
+
 // ─── /api/info ───────────────────────────────────────────────
 // Returns yt-dlp JSON metadata for a given URL
 app.get('/api/info', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'Missing url parameter' });
 
-  console.log(`[INFO] Fetching metadata for: ${url}`);
+  const cleanUrl = sanitizeUrl(url);
+  console.log(`[INFO] Fetching metadata for: ${cleanUrl} (raw: ${url})`);
 
   const cookiesPath = getCookiesPath();
 
@@ -87,7 +103,7 @@ app.get('/api/info', async (req, res) => {
     args.push('--cookies', cookiesPath);
   }
 
-  args.push(url);
+  args.push(cleanUrl);
 
   const proc = spawn('yt-dlp', args);
   let rawData = '';
@@ -162,8 +178,8 @@ app.get('/api/info', async (req, res) => {
           : '—';
         const width = Math.round((height * 16) / 9);
 
-        // Universal format selector prioritizing requested resolution with automatic fallbacks
-        const fmt = `bv*[height<=${height}]+ba/b[height<=${height}]/bv*+ba/b/best`;
+        // Robust format selector prioritizing requested resolution with optional height matching
+        const fmt = `bestvideo[height<=?${height}]+bestaudio/bestvideo+bestaudio/best`;
 
         return {
           id: fmt,
@@ -233,7 +249,8 @@ app.get('/api/download', (req, res) => {
   const fileId = `vortx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const tmpTemplate = path.join(os.tmpdir(), `${fileId}.%(ext)s`);
 
-  console.log(`[DOWNLOAD] url=${url} format=${format} type=${type} file=${safeFilename}`);
+  const cleanUrl = sanitizeUrl(url);
+  console.log(`[DOWNLOAD] cleanUrl=${cleanUrl} (raw=${url}) format=${format} type=${type} file=${safeFilename}`);
 
   const args = [
     '--no-playlist',
@@ -255,25 +272,25 @@ app.get('/api/download', (req, res) => {
 
   if (isAudio) {
     const quality = audioQuality || '2';
-    const audioFmt = format ? `${format}/bestaudio/ba/best` : 'bestaudio/ba/best';
+    const audioFmt = 'bestaudio/best';
     args.push(
       '-f', audioFmt,
       '--extract-audio',
       '--audio-format', 'mp3',
       '--audio-quality', quality,
       '-o', tmpTemplate,
-      url
+      cleanUrl
     );
   } else {
-    // Extract target height if present, or construct 5-stage fallback format selector
-    let targetFmt = 'bv*+ba/b/best';
+    // Extract target height if present and construct optional height matching selector
+    let targetFmt = 'bestvideo+bestaudio/best';
     if (format) {
-      const match = format.match(/height<=?(\d+)/);
+      const match = format.match(/height<=?\??(\d+)/);
       if (match && match[1]) {
         const h = match[1];
-        targetFmt = `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b/best`;
+        targetFmt = `bestvideo[height<=?${h}]+bestaudio/bestvideo+bestaudio/best`;
       } else {
-        targetFmt = `${format}/bv*+ba/b/best`;
+        targetFmt = `${format}/bestvideo+bestaudio/best`;
       }
     }
     console.log(`[DOWNLOAD] Resolved targetFmt: ${targetFmt}`);
@@ -281,7 +298,7 @@ app.get('/api/download', (req, res) => {
       '-f', targetFmt,
       '--merge-output-format', 'mp4',
       '-o', tmpTemplate,
-      url
+      cleanUrl
     );
   }
 
