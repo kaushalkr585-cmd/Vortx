@@ -45,6 +45,24 @@ const STANDARD_RESOLUTIONS = [
   { height: 2160, label: '2160p 4K', resolution: '3840×2160', estimatedSize: '1.1 GB', hdr: true },
 ];
 
+// Helper function to resolve cookies from YOUTUBE_COOKIES env var or cookies.txt file
+function getCookiesPath() {
+  if (process.env.YOUTUBE_COOKIES && process.env.YOUTUBE_COOKIES.trim().length > 0) {
+    try {
+      const envPath = path.join(os.tmpdir(), 'vortx_yt_cookies.txt');
+      fs.writeFileSync(envPath, process.env.YOUTUBE_COOKIES.trim());
+      return envPath;
+    } catch (e) {
+      console.error('[COOKIES] Failed to write YOUTUBE_COOKIES env var to file:', e);
+    }
+  }
+
+  return [
+    path.join(__dirname, 'cookies.txt'),
+    path.join(__dirname, '../cookies.txt'),
+  ].find(p => fs.existsSync(p)) || null;
+}
+
 // ─── /api/info ───────────────────────────────────────────────
 // Returns yt-dlp JSON metadata for a given URL
 app.get('/api/info', async (req, res) => {
@@ -53,18 +71,15 @@ app.get('/api/info', async (req, res) => {
 
   console.log(`[INFO] Fetching metadata for: ${url}`);
 
-  const cookiesPath = [
-    path.join(__dirname, 'cookies.txt'),
-    path.join(__dirname, '../cookies.txt'),
-  ].find(p => fs.existsSync(p));
+  const cookiesPath = getCookiesPath();
 
   const args = [
     '--no-playlist',
     '--no-warnings',
     '--dump-json',
     '--quiet',
-    '--extractor-args', 'youtube:player_client=ios,mweb',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    '--extractor-args', 'youtube:player_client=tv_embedded,android,mweb,ios',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   ];
 
   if (cookiesPath) {
@@ -222,16 +237,11 @@ app.get('/api/download', (req, res) => {
   const args = [
     '--no-playlist',
     '--no-warnings',
-    '--extractor-args', 'youtube:player_client=ios,mweb',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    '--extractor-args', 'youtube:player_client=tv_embedded,android,mweb,ios',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   ];
 
-  // Check for cookies file in root or server directory
-  const cookiesPath = [
-    path.join(__dirname, 'cookies.txt'),
-    path.join(__dirname, '../cookies.txt'),
-  ].find(p => fs.existsSync(p));
-
+  const cookiesPath = getCookiesPath();
   if (cookiesPath) {
     console.log(`[DOWNLOAD] Using cookies file from: ${cookiesPath}`);
     args.push('--cookies', cookiesPath);
