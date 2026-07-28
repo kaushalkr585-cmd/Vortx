@@ -169,13 +169,33 @@ app.get('/api/info', async (req, res) => {
         720: '720p HD', 1080: '1080p Full HD', 1440: '1440p 2K', 2160: '2160p 4K',
       };
 
+      const durationSecs = data.duration || 0;
+      const durationStr = durationSecs > 0
+        ? `${Math.floor(durationSecs / 60)}:${String(durationSecs % 60).padStart(2, '0')}`
+        : '—';
+
+      // Dynamic size calculation helper based on duration and resolution bitrate
+      const estimateSizeString = (sizeBytes, height) => {
+        let bytes = sizeBytes;
+        if (!bytes || bytes === 0) {
+          if (durationSecs > 0) {
+            const BITRATE_MAP = {
+              144: 150000, 240: 350000, 360: 700000, 480: 1200000,
+              720: 2500000, 1080: 4500000, 1440: 9000000, 2160: 18000000,
+            };
+            const bps = BITRATE_MAP[height] || (height * 4000);
+            bytes = Math.round((bps / 8) * durationSecs);
+          }
+        }
+        if (!bytes || bytes === 0) return '—';
+        if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`;
+        const mb = Math.round(bytes / 1048576);
+        return mb > 0 ? `${mb} MB` : `${Math.round(bytes / 1024)} KB`;
+      };
+
       const videoFormats = targetHeights.map((height) => {
         const sizeBytes = sizeByHeight.get(height) || 0;
-        const sizeStr = sizeBytes > 0
-          ? sizeBytes > 1073741824
-            ? `${(sizeBytes / 1073741824).toFixed(1)} GB`
-            : `${Math.round(sizeBytes / 1048576)} MB`
-          : '—';
+        const sizeStr = estimateSizeString(sizeBytes, height);
         const width = Math.round((height * 16) / 9);
 
         // Robust format selector prioritizing requested resolution with optional height matching
@@ -194,12 +214,19 @@ app.get('/api/info', async (req, res) => {
         };
       });
 
-      // Audio formats
+      // Audio formats with dynamic size based on duration
+      const estimateAudioSize = (bitrateKbps) => {
+        if (!durationSecs || durationSecs === 0) return '10 MB';
+        const bytes = Math.round(((bitrateKbps * 1000) / 8) * durationSecs);
+        const mb = Math.round(bytes / 1048576);
+        return mb > 0 ? `${mb} MB` : `${Math.round(bytes / 1024)} KB`;
+      };
+
       const audioFormats = [
-        { id: 'bestaudio/best', bitrate: '128 kbps', codec: 'MP3', estimatedSize: '8 MB',  audioQuality: '5' },
-        { id: 'bestaudio/best', bitrate: '192 kbps', codec: 'MP3', estimatedSize: '14 MB', audioQuality: '3' },
-        { id: 'bestaudio/best', bitrate: '256 kbps', codec: 'MP3', estimatedSize: '19 MB', audioQuality: '2', recommended: true },
-        { id: 'bestaudio/best', bitrate: '320 kbps', codec: 'MP3', estimatedSize: '30 MB', audioQuality: '0' },
+        { id: 'bestaudio/best', bitrate: '128 kbps', codec: 'MP3', estimatedSize: estimateAudioSize(128), audioQuality: '5' },
+        { id: 'bestaudio/best', bitrate: '192 kbps', codec: 'MP3', estimatedSize: estimateAudioSize(192), audioQuality: '3' },
+        { id: 'bestaudio/best', bitrate: '256 kbps', codec: 'MP3', estimatedSize: estimateAudioSize(256), audioQuality: '2', recommended: true },
+        { id: 'bestaudio/best', bitrate: '320 kbps', codec: 'MP3', estimatedSize: estimateAudioSize(320), audioQuality: '0' },
       ];
 
       const thumbnail =
