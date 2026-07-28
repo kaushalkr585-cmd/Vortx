@@ -78,7 +78,8 @@ app.get('/api/info', async (req, res) => {
     '--no-warnings',
     '--dump-json',
     '--quiet',
-    '--extractor-args', 'youtube:player_client=tv_embedded,android,mweb,ios',
+    '--js-runtimes', 'node',
+    '--remote-components', 'ejs:github',
     '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   ];
 
@@ -237,7 +238,8 @@ app.get('/api/download', (req, res) => {
   const args = [
     '--no-playlist',
     '--no-warnings',
-    '--extractor-args', 'youtube:player_client=tv_embedded,android,mweb,ios',
+    '--js-runtimes', 'node',
+    '--remote-components', 'ejs:github',
     '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   ];
 
