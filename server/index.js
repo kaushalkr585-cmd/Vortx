@@ -71,10 +71,26 @@ function getCookiesPath() {
   const envCookies = process.env.YOUTUBE_COOKIES;
   if (envCookies && envCookies.trim().length > 0) {
     try {
-      const envPath = path.join(os.tmpdir(), 'vortx_yt_cookies.txt');
-      fs.writeFileSync(envPath, envCookies.trim(), 'utf8');
-      console.log('[COOKIES] Loaded cookies from YOUTUBE_COOKIES env var');
-      return envPath;
+      let cookieText = envCookies.trim();
+      // Handle escaped \n if env var was set as a single string literal
+      if (!cookieText.includes('\n') && cookieText.includes('\\n')) {
+        cookieText = cookieText.replace(/\\n/g, '\n');
+      }
+
+      const hasYT = cookieText.includes('youtube.com') || cookieText.includes('.youtube.com');
+      const hasAuth = cookieText.includes('__Secure-3PAPISID') ||
+                      cookieText.includes('SAPISID') ||
+                      cookieText.includes('__Secure-3PSID') ||
+                      cookieText.includes('LOGIN_INFO');
+
+      if (hasYT && hasAuth) {
+        const envPath = path.join(os.tmpdir(), 'vortx_yt_cookies.txt');
+        fs.writeFileSync(envPath, cookieText, 'utf8');
+        console.log('[COOKIES] Loaded cookies from YOUTUBE_COOKIES env var');
+        return envPath;
+      } else {
+        console.warn('[COOKIES] YOUTUBE_COOKIES env var present but missing required YouTube auth tokens');
+      }
     } catch (e) {
       console.error('[COOKIES] Failed to write YOUTUBE_COOKIES env to file:', e.message);
     }
@@ -88,12 +104,11 @@ function getCookiesPath() {
     if (fs.existsSync(p)) {
       try {
         const content = fs.readFileSync(p, 'utf8');
-        // Validate it contains YouTube authentication cookies
-        // yt-dlp normalizes SAPISID → __Secure-3PAPISID when writing the file
         const hasYT = content.includes('youtube.com');
         const hasAuth = content.includes('__Secure-3PAPISID') ||
                         content.includes('SAPISID') ||
-                        content.includes('__Secure-3PSID');
+                        content.includes('__Secure-3PSID') ||
+                        content.includes('LOGIN_INFO');
         if (hasYT && hasAuth) {
           console.log(`[COOKIES] Using cookie file: ${p}`);
           return p;
@@ -365,6 +380,26 @@ app.get('/api/cookies/status', (_req, res) => {
   }
 });
 
+// ─── Helper: Execute yt-dlp ────────────────────────────────────
+function runYtdlp(args) {
+  return new Promise((resolve) => {
+    const proc = spawn('yt-dlp', args);
+    let rawData = '';
+    let errData = '';
+
+    proc.stdout.on('data', chunk => { rawData += chunk.toString(); });
+    proc.stderr.on('data', chunk => { errData += chunk.toString(); });
+
+    proc.on('error', (err) => {
+      resolve({ code: -1, stdout: '', stderr: err.message, spawnError: true });
+    });
+
+    proc.on('close', (code) => {
+      resolve({ code, stdout: rawData, stderr: errData });
+    });
+  });
+}
+
 // ─── /api/info ────────────────────────────────────────────────
 app.get('/api/info', async (req, res) => {
   const rawUrl = req.query.url;
@@ -393,48 +428,42 @@ app.get('/api/info', async (req, res) => {
   }
 
   const cookiesPath = getCookiesPath();
-  const args = [
-    ...buildBaseArgs(cookiesPath),
-    '--dump-json',
-    cleanUrl,
-  ];
+  let args = [...buildBaseArgs(cookiesPath), '--dump-json', cleanUrl];
 
-  const proc = spawn('yt-dlp', args);
-  let rawData = '';
-  let errData = '';
+  let result = await runYtdlp(args);
 
-  proc.stdout.on('data', chunk => { rawData += chunk.toString(); });
-  proc.stderr.on('data', chunk => { errData += chunk.toString(); });
+  if (result.spawnError) {
+    return res.status(503).json({
+      success: false,
+      code: 'YTDLP_NOT_FOUND',
+      message: 'yt-dlp is not installed on the server.',
+      solution: 'Run: pip install yt-dlp',
+      details: result.stderr,
+    });
+  }
 
-  proc.on('error', (err) => {
-    console.error('[INFO] Failed to spawn yt-dlp:', err.message);
-    if (!res.headersSent) {
-      res.status(503).json({
-        success: false,
-        code: 'YTDLP_NOT_FOUND',
-        message: 'yt-dlp is not installed on the server.',
-        solution: 'Run: pip install yt-dlp',
-        details: err.message,
-      });
+  // If failed with cookies, retry WITHOUT cookies
+  if (result.code !== 0 && cookiesPath) {
+    console.warn('[INFO] yt-dlp failed with cookies. Retrying without cookies...');
+    const noCookieArgs = [...buildBaseArgs(null), '--dump-json', cleanUrl];
+    const retryResult = await runYtdlp(noCookieArgs);
+    if (retryResult.code === 0) {
+      result = retryResult;
     }
-  });
+  }
 
-  proc.on('close', (code) => {
-    if (code !== 0) {
-      console.error(`[INFO] yt-dlp exited ${code}: ${errData.slice(0, 500)}`);
-      const parsed = parseYtdlpError(errData);
-      if (!res.headersSent) {
-        return res.status(422).json({
-          success: false,
-          ...parsed,
-          details: errData.trim().slice(0, 300),
-        });
-      }
-      return;
-    }
+  if (result.code !== 0) {
+    console.error(`[INFO] yt-dlp exited ${result.code}: ${result.stderr.slice(0, 500)}`);
+    const parsed = parseYtdlpError(result.stderr);
+    return res.status(422).json({
+      success: false,
+      ...parsed,
+      details: result.stderr.trim().slice(0, 300),
+    });
+  }
 
-    try {
-      const data = JSON.parse(rawData);
+  try {
+    const data = JSON.parse(result.stdout);
 
       // ── Build format list ──────────────────────────────────
       const rawFormats = Array.isArray(data.formats) ? data.formats : [];
@@ -565,7 +594,6 @@ app.get('/api/info', async (req, res) => {
         });
       }
     }
-  });
 });
 
 // ─── /api/download ────────────────────────────────────────────
