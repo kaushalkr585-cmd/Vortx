@@ -458,19 +458,21 @@ function runYtdlp(args) {
  * YouTube's free public oEmbed API to get basic metadata.
  * No authentication, no cookies, works from any IP.
  */
-function httpsGet(url) {
+function httpsGet(url, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Request timed out')), timeoutMs);
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
+        clearTimeout(timer);
         if (res.statusCode >= 200 && res.statusCode < 300) {
           resolve(data);
         } else {
           reject(new Error(`HTTP ${res.statusCode}`));
         }
       });
-    }).on('error', reject);
+    }).on('error', (e) => { clearTimeout(timer); reject(e); });
   });
 }
 
@@ -491,6 +493,72 @@ function extractVideoId(url) {
     }
   } catch { /* ignore */ }
   return null;
+}
+
+// ─── Invidious Fallback for Downloads ────────────────────────────
+/**
+ * When yt-dlp is blocked on cloud IPs, query Invidious (a YouTube frontend)
+ * to get the direct CDN URL, then redirect the browser to it.
+ * The browser downloads directly from YouTube’s CDN — bypasses Render’s IP.
+ */
+const INVIDIOUS_INSTANCES = [
+  'https://iv.datura.network',
+  'https://invidious.nerdvpn.de',
+  'https://inv.tux.pizza',
+  'https://invidious.privacydev.net',
+  'https://yt.cdaut.de',
+  'https://invidious.darkness.services',
+];
+
+async function tryInvidiousDownload(res, videoId, format, isAudio, safeFilename) {
+  // Parse target height from format string e.g. "bestvideo[height<=?720]+..."
+  let targetHeight = 720;
+  if (format) {
+    const m = format.match(/height<=?\??(\d+)/);
+    if (m && m[1]) targetHeight = parseInt(m[1]);
+  }
+
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      console.log(`[INVIDIOUS] Trying ${instance} for videoId=${videoId}`);
+      const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}`, 10000);
+      const data = JSON.parse(raw);
+
+      let directUrl = null;
+
+      if (isAudio) {
+        // Get best audio-only stream
+        const audioFmts = (data.adaptiveFormats || [])
+          .filter(f => f.type && f.type.startsWith('audio/') && f.url);
+        audioFmts.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        if (audioFmts[0]?.url) directUrl = audioFmts[0].url;
+      } else {
+        // formatStreams = muxed (video+audio in one file, MP4) — ideal for direct download
+        const muxed = (data.formatStreams || []).filter(f => f.url);
+        muxed.sort((a, b) => {
+          const ha = parseInt((a.resolution || '0').replace('p', '')) || 0;
+          const hb = parseInt((b.resolution || '0').replace('p', '')) || 0;
+          return hb - ha;
+        });
+        // Find best quality that doesn’t exceed target height
+        const match = muxed.find(f => {
+          const h = parseInt((f.resolution || '9999').replace('p', '')) || 9999;
+          return h <= targetHeight;
+        }) || muxed[muxed.length - 1];
+        if (match?.url) directUrl = match.url;
+      }
+
+      if (directUrl) {
+        console.log(`[INVIDIOUS] ✓ Got direct CDN URL from ${instance} — redirecting client`);
+        // Content-Disposition hint (browser may override based on URL)
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+        return res.redirect(302, directUrl);
+      }
+    } catch (e) {
+      console.warn(`[INVIDIOUS] ${instance} failed: ${e.message}`);
+    }
+  }
+  return false; // all instances failed
 }
 
 function buildOEmbedResponse(rawUrl, oembed) {
@@ -816,15 +884,26 @@ app.get('/api/download', async (req, res) => {
 
   if (result.code !== 0) {
     console.error(`[DOWNLOAD] yt-dlp exited ${result.code}: ${result.stderr.slice(0, 500)}`);
-    if (!res.headersSent) {
-      const parsed = parseYtdlpError(result.stderr);
-      return res.status(422).json({
-        success: false,
-        ...parsed,
-        details: result.stderr.trim().slice(0, 300),
-      });
+    if (res.headersSent) return;
+
+    const parsedErr = parseYtdlpError(result.stderr);
+    const isBotBlocked = parsedErr.code === 'BOT_DETECTED';
+    const isYouTube = cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be');
+    const videoId = extractVideoId(cleanUrl);
+
+    // ── Invidious fallback: redirect browser to direct CDN URL ──
+    if (isBotBlocked && isYouTube && videoId) {
+      console.warn('[DOWNLOAD] Bot blocked. Attempting Invidious fallback...');
+      const redirected = await tryInvidiousDownload(res, videoId, format, isAudio, safeFilename);
+      if (redirected) return;
+      console.warn('[DOWNLOAD] All Invidious instances failed.');
     }
-    return;
+
+    return res.status(422).json({
+      success: false,
+      ...parsedErr,
+      details: result.stderr.trim().slice(0, 300),
+    });
   }
 
   const tmpDir = os.tmpdir();
