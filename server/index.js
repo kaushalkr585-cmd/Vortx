@@ -1008,10 +1008,11 @@ app.get('/api/stream', async (req, res) => {
       cleanUrl
     );
   } else {
+    // Prefer H.264+AAC (native mp4 streams) for clean merging
+    // Use mkv as merge container — accepts ALL codecs (AV1, VP9, AAC, opus) without errors
     downloadExtraArgs.push(
-      '-f', `bv*[height<=?${height}]+ba/b[height<=?${height}]/bv*+ba/b/best`,
-      '--merge-output-format', 'mp4',
-      '--remux-video', 'mp4',
+      '-f', `bv[height<=?${height}][ext=mp4]+ba[ext=m4a]/bv[height<=?${height}]+ba/b[height<=?${height}]/best`,
+      '--merge-output-format', 'mkv',
       '-o', tmpTemplate,
       cleanUrl
     );
@@ -1108,21 +1109,21 @@ app.get('/api/download', async (req, res) => {
       cleanUrl
     );
   } else {
-    let targetFmt = 'bv*+ba/b/best';
+    let targetFmt = 'bv[ext=mp4]+ba[ext=m4a]/bv+ba/b/best';
     if (format) {
-      const match = format.match(/height<=?\??(\d+)/);
-      if (match && match[1]) {
-        const h = match[1];
-        targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b/best`;
+      const heightMatch = format.match(/(\d+)/);
+      if (heightMatch && heightMatch[1]) {
+        const h = heightMatch[1];
+        targetFmt = `bv[height<=?${h}][ext=mp4]+ba[ext=m4a]/bv[height<=?${h}]+ba/b[height<=?${h}]/best`;
       } else {
-        targetFmt = `${format}/bv*+ba/b/best`;
+        targetFmt = `${format}/bv[ext=mp4]+ba[ext=m4a]/bv+ba/b/best`;
       }
     }
     console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
+    // mkv accepts ALL codecs (AV1, VP9, AAC, opus) without transcoding errors
     downloadExtraArgs.push(
       '-f', targetFmt,
-      '--merge-output-format', 'mp4',
-      '--remux-video', 'mp4',
+      '--merge-output-format', 'mkv',
       '-o', tmpTemplate,
       cleanUrl
     );
