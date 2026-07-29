@@ -1095,12 +1095,20 @@ app.get('/api/download', async (req, res) => {
     const isYouTube = cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be');
     const videoId = extractVideoId(cleanUrl);
 
-    // ── Invidious fallback: redirect browser to direct CDN URL ──
+    // ── Stream resolution fallback ──
     if (isBotBlocked && isYouTube && videoId) {
-      console.warn('[DOWNLOAD] Bot blocked. Attempting Invidious fallback...');
-      const redirected = await tryInvidiousDownload(res, videoId, format, isAudio, safeFilename);
-      if (redirected) return;
-      console.warn('[DOWNLOAD] All Invidious instances failed.');
+      console.warn('[DOWNLOAD] Bot blocked on yt-dlp. Attempting stream resolution fallback...');
+      let targetHeight = 720;
+      if (format) {
+        const m = format.match(/height<=?\??(\d+)/);
+        if (m && m[1]) targetHeight = parseInt(m[1]);
+      }
+      const fallbackStreamUrl = await resolveYouTubeStreamUrl(videoId, isAudio, targetHeight);
+      if (fallbackStreamUrl) {
+        const ok = await proxyStreamToClient(res, fallbackStreamUrl, safeFilename, isAudio);
+        if (ok) return;
+      }
+      console.warn('[DOWNLOAD] All stream resolution fallbacks failed.');
     }
 
     return res.status(422).json({
