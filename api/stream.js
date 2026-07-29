@@ -15,6 +15,8 @@ const PIPED_INSTANCES = [
   'https://api.piped.yt',
   'https://piped.tokhmi.xyz',
   'https://piped.moomoo.me',
+  'https://pipedapi.tokhmi.xyz',
+  'https://piped.adminforge.de',
 ];
 
 const CORS_HEADERS = {
@@ -78,28 +80,38 @@ export default async function handler(request) {
     }
   }
 
-  // ── Try Cobalt as fallback (server-to-server) ────────────────────
+  // ── Try Cobalt as fallback (updated API: POST / with vQuality) ──────────────
   if (!streamUrl) {
-    try {
-      const cobaltResp = await fetch('https://api.cobalt.tools/', {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: `https://www.youtube.com/watch?v=${videoId}`,
-          videoQuality: String(height),
-          isAudioOnly: isAudio,
-          filenameStyle: 'basic',
-        }),
-        signal: AbortSignal.timeout(8000),
-      });
+    // Try multiple public Cobalt instances
+    const cobaltInstances = [
+      'https://api.cobalt.tools',
+      'https://cobalt.tools',
+    ];
+    for (const cobaltBase of cobaltInstances) {
+      try {
+        const cobaltResp = await fetch(`${cobaltBase}/`, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: `https://www.youtube.com/watch?v=${videoId}`,
+            vQuality: String(height),
+            isAudioOnly: isAudio,
+            filenameStyle: 'basic',
+            disableMetadata: true,
+          }),
+          signal: AbortSignal.timeout(8000),
+        });
 
-      if (cobaltResp.ok) {
-        const data = await cobaltResp.json();
-        streamUrl = data.url ?? data.tunnelUrl ?? null;
-        if (streamUrl) console.log('[EDGE] Cobalt → got stream URL');
+        if (cobaltResp.ok) {
+          const data = await cobaltResp.json();
+          streamUrl = data.url ?? data.tunnel ?? null;
+          if (streamUrl) { console.log(`[EDGE] Cobalt ${cobaltBase} → got stream URL`); break; }
+        } else {
+          console.warn(`[EDGE] Cobalt ${cobaltBase} returned HTTP ${cobaltResp.status}`);
+        }
+      } catch (e) {
+        console.warn(`[EDGE] Cobalt ${cobaltBase} failed: ${e.message}`);
       }
-    } catch (e) {
-      console.warn(`[EDGE] Cobalt failed: ${e.message}`);
     }
   }
 

@@ -496,16 +496,18 @@ const PIPED_INSTANCES = [
   'https://piped.tokhmi.xyz',
   'https://piped.moomoo.me',
   'https://piped.yt',
+  'https://pipedapi.tokhmi.xyz',
+  'https://piped.adminforge.de',
 ];
 
 const INVIDIOUS_INSTANCES = [
-  'https://vid.puffyan.us',
-  'https://inv.riverside.rocks',
+  'https://iv.datura.network',
+  'https://invidious.nerdvpn.de',
+  'https://inv.tux.pizza',
+  'https://invidious.privacyredirect.com',
   'https://yt.artemislena.eu',
   'https://invidious.flokinet.to',
   'https://invidious.tiekoetter.com',
-  'https://invidious.snopyta.org',
-  'https://invidious.esmailelbob.xyz',
 ];
 
 /** Proxies a CDN/stream URL through the server to the HTTP response. */
@@ -561,33 +563,46 @@ function proxyStreamToClient(res, streamUrl, filename, isAudio) {
 
 /** Races all providers in parallel and returns the first working stream URL. */
 async function resolveYouTubeStreamUrl(videoId, isAudio, targetHeight) {
-  // ─ Cobalt helper
+  // ─ Cobalt helper (updated API: POST / with vQuality)
   function cobaltPromise() {
     return new Promise((resolve, reject) => {
       const body = JSON.stringify({
         url: `https://www.youtube.com/watch?v=${videoId}`,
-        videoQuality: String(targetHeight),
+        vQuality: String(targetHeight),
         isAudioOnly: Boolean(isAudio),
+        filenameStyle: 'basic',
+        disableMetadata: true,
       });
-      const r = https.request({
-        hostname: 'api.cobalt.tools', path: '/api/json', method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        timeout: 9000,
-      }, (upstream) => {
-        let d = '';
-        upstream.on('data', c => d += c);
-        upstream.on('end', () => {
-          try {
-            const parsed = JSON.parse(d);
-            if (parsed.url) resolve(parsed.url);
-            else reject(new Error('No URL from Cobalt'));
-          } catch { reject(new Error('Cobalt JSON parse fail')); }
+      // Try multiple Cobalt instances
+      const cobaltHosts = [
+        { hostname: 'api.cobalt.tools', path: '/' },
+      ];
+      let tried = 0;
+      function tryNext() {
+        if (tried >= cobaltHosts.length) { reject(new Error('All Cobalt instances failed')); return; }
+        const { hostname, path } = cobaltHosts[tried++];
+        const r = https.request({
+          hostname, path, method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 9000,
+        }, (upstream) => {
+          let d = '';
+          upstream.on('data', c => d += c);
+          upstream.on('end', () => {
+            try {
+              const parsed = JSON.parse(d);
+              const url = parsed.url || parsed.tunnel || null;
+              if (url) resolve(url);
+              else { console.warn(`[COBALT] ${hostname} - no URL in response`); tryNext(); }
+            } catch { tryNext(); }
+          });
         });
-      });
-      r.on('error', reject);
-      r.on('timeout', () => { r.destroy(); reject(new Error('Cobalt timeout')); });
-      r.write(body);
-      r.end();
+        r.on('error', (e) => { console.warn(`[COBALT] ${hostname} error: ${e.message}`); tryNext(); });
+        r.on('timeout', () => { r.destroy(); tryNext(); });
+        r.write(body);
+        r.end();
+      }
+      tryNext();
     });
   }
 
@@ -644,9 +659,11 @@ async function resolveYouTubeStreamUrl(videoId, isAudio, targetHeight) {
         cobaltPromise(),
         pipedPromise('https://pipedapi.kavin.rocks'),
         pipedPromise('https://api.piped.yt'),
+        pipedPromise('https://pipedapi.tokhmi.xyz'),
         invidiousPromise('https://iv.datura.network'),
         invidiousPromise('https://invidious.nerdvpn.de'),
         invidiousPromise('https://inv.tux.pizza'),
+        invidiousPromise('https://invidious.privacyredirect.com'),
       ]),
       hardTimeout,
     ]);
