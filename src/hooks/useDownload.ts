@@ -1,12 +1,9 @@
 // ============================================================
 // VORTX — useDownload Hook (Production)
-// Strategy:
-//   1. Warm up Render server (handles cold-start 502 / CORS issue)
-//   2. Ask server to proxy the download (Cobalt/Piped/Invidious)
-//   3. If server returns STREAM_UNAVAILABLE → client-side fallback:
-//      call Invidious API directly from the browser (user's IP is
-//      not blocked by YouTube, unlike Render's cloud IP).
-//      Uses ?local=true for CORS-enabled proxied URLs.
+// Download Strategy (in priority order):
+//   1. Server-side stream proxy (Render backend)
+//   2. Cobalt API from browser (CORS-enabled download service)
+//   3. Piped API from browser → blob download or window.open()
 // ============================================================
 
 import { useState, useCallback, useRef } from 'react';
@@ -26,23 +23,7 @@ export type DownloadState =
   | { status: 'complete'; filename: string }
   | { status: 'error'; message: string; code?: VortxErrorCode; solution?: string };
 
-// ── Client-side Invidious fallback ────────────────────────────────
-// Called when the server can't proxy the stream (all cloud providers blocked).
-// The BROWSER's IP is not blocked by YouTube, so this works!
-const CLIENT_INVIDIOUS = [
-  'https://vid.puffyan.us',
-  'https://inv.riverside.rocks',
-  'https://yt.artemislena.eu',
-  'https://invidious.flokinet.to',
-  'https://invidious.tiekoetter.com',
-  'https://invidious.snopyta.org',
-];
-
-const CLIENT_PIPED = [
-  'https://pipedapi.kavin.rocks',
-  'https://api.piped.yt',
-  'https://piped.tokhmi.xyz',
-];
+// ── Helpers ───────────────────────────────────────────────────────
 
 function extractVideoId(url: string): string | null {
   try {
@@ -52,6 +33,22 @@ function extractVideoId(url: string): string | null {
   } catch { /* ignore */ }
   return null;
 }
+
+function triggerBlobDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+// ── Client-side download fallback ────────────────────────────────
+// Called when Render's server can't proxy the stream.
+// The BROWSER's IP is not blocked by YouTube, so direct API calls work!
 
 async function clientSideDownload(
   mediaUrl: string,
@@ -68,63 +65,94 @@ async function clientSideDownload(
     return m ? parseInt(m[1]) : 720;
   })();
 
-  // ── Try Piped API first (has CORS, fast) ────────────────────────
-  for (const instance of CLIENT_PIPED) {
-    try {
-      onProgress(`Trying ${new URL(instance).hostname}…`);
-      const resp = await fetch(`${instance}/streams/${videoId}`, { signal: AbortSignal.timeout(8000) });
-      if (!resp.ok) continue;
-      const data = await resp.json();
+  // ── 1. Cobalt API (purpose-built downloader with CORS) ─────────
+  // Cobalt tunnel URLs set Content-Disposition: attachment, so
+  // window.open() actually triggers a file download (not just play).
+  const COBALT_INSTANCES = [
+    'https://api.cobalt.tools',
+    'https://cobalt.api.012.one',
+    'https://co.wuk.sh',
+  ];
 
-      let streamUrl: string | null = null;
-      if (isAudio) {
-        const streams: any[] = (data.audioStreams || []).filter((s: any) => s.url);
-        streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        streamUrl = streams[0]?.url ?? null;
-      } else {
-        const muxed: any[] = (data.videoStreams || []).filter((s: any) => s.url && !s.videoOnly);
-        muxed.sort((a, b) => {
-          const qa = parseInt((a.quality || '').replace('p', '') || '0');
-          const qb = parseInt((b.quality || '').replace('p', '') || '0');
-          return qb - qa;
-        });
-        const match = muxed.find(s => parseInt((s.quality || '').replace('p', '') || '9999') <= targetHeight)
-          ?? muxed[muxed.length - 1];
-        streamUrl = match?.url ?? null;
+  for (const cobaltBase of COBALT_INSTANCES) {
+    try {
+      onProgress(`Trying Cobalt (${new URL(cobaltBase).hostname})…`);
+      const body = JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        videoQuality: String(targetHeight),
+        isAudioOnly: isAudio,
+        isNoTTWatermark: true,
+        filenameStyle: 'basic',
+      });
+
+      let cobaltUrl: string | null = null;
+      let cobaltStatus: string = '';
+
+      // Try new API endpoint first
+      for (const endpoint of [`${cobaltBase}/`, `${cobaltBase}/api/json`]) {
+        try {
+          const resp = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+            body,
+            signal: AbortSignal.timeout(8000),
+          });
+          if (!resp.ok) continue;
+          const data = await resp.json();
+          cobaltUrl = data.url || data.tunnelUrl || null;
+          cobaltStatus = data.status || '';
+          if (cobaltUrl) break;
+        } catch { /* try next endpoint */ }
       }
 
-      if (streamUrl) {
-        // Try fetching the stream (works if URL has CORS headers)
-        try {
-          onProgress('Downloading stream…');
-          const vidResp = await fetch(streamUrl, { signal: AbortSignal.timeout(60000), mode: 'cors' });
-          if (vidResp.ok) {
-            const blob = await vidResp.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 30000);
-            return true;
-          }
-        } catch {
-          // CORS blocked — open in new tab as last resort
-          window.open(streamUrl, '_blank');
+      if (cobaltUrl) {
+        onProgress('Download link found, starting…');
+
+        // For tunnel URLs: Content-Disposition:attachment → window.open() downloads the file
+        // For redirect URLs (YouTube CDN): try blob fetch first, fall back to window.open()
+        if (cobaltStatus === 'tunnel') {
+          // Tunnel has CORS — try blob download for best experience
+          try {
+            const streamResp = await fetch(cobaltUrl, { signal: AbortSignal.timeout(120000), mode: 'cors' });
+            if (streamResp.ok) {
+              const blob = await streamResp.blob();
+              triggerBlobDownload(blob, filename);
+              return true;
+            }
+          } catch { /* CORS failed — fall through to window.open */ }
+
+          // Content-Disposition: attachment means window.open triggers download
+          window.open(cobaltUrl, '_blank');
           return true;
         }
+
+        // Redirect URL (YouTube CDN) — try blob, fall to window.open
+        try {
+          const streamResp = await fetch(cobaltUrl, { signal: AbortSignal.timeout(120000), mode: 'cors' });
+          if (streamResp.ok) {
+            const blob = await streamResp.blob();
+            triggerBlobDownload(blob, filename);
+            return true;
+          }
+        } catch { /* CORS failed */ }
+
+        window.open(cobaltUrl, '_blank');
+        return true;
       }
-    } catch { /* this instance failed, try next */ }
+    } catch { /* this cobalt instance failed */ }
   }
 
-  // ── Try Invidious with ?local=true (proxied URLs with CORS) ─────
-  for (const instance of CLIENT_INVIDIOUS) {
+  // ── 2. Piped API (has CORS, proxies streams through their servers) ─
+  const PIPED_INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://piped.tokhmi.xyz',
+    'https://piped.moomoo.me',
+  ];
+
+  for (const instance of PIPED_INSTANCES) {
     try {
-      onProgress(`Trying ${new URL(instance).hostname}…`);
-      const resp = await fetch(`${instance}/api/v1/videos/${videoId}?local=true`, {
+      onProgress(`Trying Piped (${new URL(instance).hostname})…`);
+      const resp = await fetch(`${instance}/streams/${videoId}`, {
         signal: AbortSignal.timeout(8000),
       });
       if (!resp.ok) continue;
@@ -132,46 +160,43 @@ async function clientSideDownload(
 
       let streamUrl: string | null = null;
       if (isAudio) {
-        const streams: any[] = (data.adaptiveFormats || [])
-          .filter((f: any) => f.type?.startsWith('audio/') && f.url);
-        streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        const streams: any[] = (data.audioStreams || []).filter((s: any) => s.url);
+        streams.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0));
         streamUrl = streams[0]?.url ?? null;
       } else {
-        const muxed: any[] = (data.formatStreams || []).filter((f: any) => f.url);
-        muxed.sort((a, b) => {
-          const ha = parseInt((a.resolution || '0').replace('p', '')) || 0;
-          const hb = parseInt((b.resolution || '0').replace('p', '')) || 0;
-          return hb - ha;
+        const muxed: any[] = (data.videoStreams || []).filter((s: any) => s.url && !s.videoOnly);
+        muxed.sort((a: any, b: any) => {
+          const qa = parseInt((a.quality || '').replace('p', '') || '0');
+          const qb = parseInt((b.quality || '').replace('p', '') || '0');
+          return qb - qa;
         });
-        const match = muxed.find(f =>
-          (parseInt((f.resolution || '9999').replace('p', '')) || 9999) <= targetHeight
+        const match = muxed.find(
+          (s: any) => parseInt((s.quality || '').replace('p', '') || '9999') <= targetHeight
         ) ?? muxed[muxed.length - 1];
         streamUrl = match?.url ?? null;
       }
 
-      if (streamUrl) {
-        try {
-          onProgress('Downloading stream…');
-          const vidResp = await fetch(streamUrl, { signal: AbortSignal.timeout(60000), mode: 'cors' });
-          if (vidResp.ok) {
-            const blob = await vidResp.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 30000);
-            return true;
-          }
-        } catch {
-          window.open(streamUrl, '_blank');
+      if (!streamUrl) continue;
+
+      // Try CORS blob download (works if Piped proxies through their domain)
+      try {
+        onProgress('Streaming from Piped…');
+        const streamResp = await fetch(streamUrl, {
+          signal: AbortSignal.timeout(120000),
+          mode: 'cors',
+        });
+        if (streamResp.ok) {
+          const blob = await streamResp.blob();
+          triggerBlobDownload(blob, filename);
           return true;
         }
+      } catch {
+        // CORS failed — open in new tab (video plays, not ideal but functional)
+        onProgress('Opening stream (CORS restriction)…');
+        window.open(streamUrl, '_blank');
+        return true;
       }
-    } catch { /* this instance failed, try next */ }
+    } catch { /* this Piped instance failed */ }
   }
 
   return false;
@@ -200,116 +225,82 @@ export function useDownload() {
     const isAudio = type === 'audio';
 
     // ── Step 1: Warm up the Render server ──────────────────────────
-    // Free Render tier cold-starts return 502 with no CORS headers.
-    // Pinging first ensures Express is alive before the download request.
     setState({ status: 'downloading', progress: { percent: 5, speed: 'Waking up server…', eta: 'Up to 30s' } });
 
-    const PING_TIMEOUT_MS = 45_000;
+    const PING_TIMEOUT_MS = 30_000;
     const pingStart = Date.now();
     let serverAwake = false;
 
     while (!controller.signal.aborted && Date.now() - pingStart < PING_TIMEOUT_MS) {
       try {
-        const pingRes = await window.fetch(`${API_BASE}/api/ping`, { signal: AbortSignal.timeout(8000) });
+        const pingRes = await window.fetch(`${API_BASE}/api/ping`, { signal: AbortSignal.timeout(6000) });
         if (pingRes.ok) { serverAwake = true; break; }
-      } catch { /* still sleeping */ }
+      } catch { /* sleeping */ }
 
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, 2500));
       const remaining = Math.round((PING_TIMEOUT_MS - (Date.now() - pingStart)) / 1000);
       setState({ status: 'downloading', progress: { percent: 12, speed: 'Waking server…', eta: `~${remaining}s` } });
     }
 
     if (controller.signal.aborted) return;
 
-    if (!serverAwake) {
-      // Server is completely down — try client-side fallback immediately
-      setState({ status: 'downloading', progress: { percent: 20, speed: 'Server offline — using browser fallback…', eta: 'Please wait' } });
-      const ok = await clientSideDownload(mediaUrl, formatId, isAudio, filename,
-        (msg) => setState({ status: 'downloading', progress: { percent: 40, speed: msg, eta: 'Please wait' } })
-      );
-      if (ok) { setState({ status: 'complete', filename }); return; }
-      setState({ status: 'error', code: 'NETWORK_ERROR', message: 'Server is unreachable and all fallbacks failed.', solution: 'Wait 30s and try again.' });
-      return;
-    }
+    // ── Step 2: If server is up, try server-side proxy ──────────────
+    if (serverAwake) {
+      setState({ status: 'downloading', progress: { percent: 20, speed: 'Contacting server…', eta: 'Please wait' } });
+      await new Promise(r => setTimeout(r, 150));
 
-    setState({ status: 'downloading', progress: { percent: 20, speed: 'Contacting server…', eta: 'Please wait' } });
-    await new Promise(r => setTimeout(r, 200));
+      const params = new URLSearchParams({
+        url: mediaUrl, format: formatId, filename, type,
+        ...(audioQuality ? { audioQuality } : {}),
+      });
 
-    // ── Step 2: Ask server to proxy the download ────────────────────
-    const params = new URLSearchParams({
-      url: mediaUrl, format: formatId, filename, type,
-      ...(audioQuality ? { audioQuality } : {}),
-    });
-    const downloadUrl = `${API_BASE}/api/download?${params.toString()}`;
+      try {
+        const response = await window.fetch(`${API_BASE}/api/download?${params}`, { signal: controller.signal });
 
-    try {
-      const response = await window.fetch(downloadUrl, { signal: controller.signal });
-
-      if (!response.ok) {
-        let errorCode: VortxErrorCode = 'YTDLP_ERROR';
-        let errorMessage = 'Download failed. Please try again.';
-        let errorSolution = 'Check that the video is publicly available.';
-
-        try {
-          const errBody = await response.json();
-          if (errBody?.code) { errorCode = errBody.code as VortxErrorCode; errorMessage = errBody.message || errorMessage; errorSolution = errBody.solution || errorSolution; }
-        } catch { /* ignore */ }
-
-        // ── Step 3: Client-side fallback when server providers all fail ─
-        if (errorCode === 'STREAM_UNAVAILABLE' || response.status === 503) {
-          setState({ status: 'downloading', progress: { percent: 30, speed: 'Server fallback — using browser…', eta: 'Please wait' } });
-          const ok = await clientSideDownload(mediaUrl, formatId, isAudio, filename,
-            (msg) => setState({ status: 'downloading', progress: { percent: 50, speed: msg, eta: 'Please wait' } })
-          );
-          if (ok) { setState({ status: 'complete', filename }); return; }
+        if (response.ok) {
+          setState({ status: 'downloading', progress: { percent: 50, speed: 'Streaming from server…', eta: 'Almost ready' } });
+          const blob = await response.blob();
+          if (controller.signal.aborted) return;
+          triggerBlobDownload(blob, filename);
+          setState({ status: 'complete', filename });
+          return;
         }
 
-        setState({ status: 'error', code: errorCode, message: errorMessage, solution: errorSolution });
-        return;
-      }
-
-      // ── Legacy JSON directUrl handling ──────────────────────────────
-      const contentType = response.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
+        // Parse error code
+        let errorCode: VortxErrorCode = 'YTDLP_ERROR';
         try {
-          const json = await response.json();
-          if (json.redirect === true && json.directUrl) {
-            const a = document.createElement('a');
-            a.href = json.directUrl; a.download = json.filename || filename;
-            a.target = '_blank'; a.rel = 'noopener noreferrer'; a.style.display = 'none';
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            setState({ status: 'complete', filename: json.filename || filename });
-            return;
-          }
-        } catch { /* fall through to blob */ }
+          const errBody = await response.json();
+          if (errBody?.code) errorCode = errBody.code as VortxErrorCode;
+        } catch { /* ignore */ }
+
+        // Fall through to client-side if server providers all failed
+        if (errorCode !== 'STREAM_UNAVAILABLE') {
+          setState({ status: 'error', code: errorCode, message: 'Download failed.', solution: 'Check that the video is publicly available.' });
+          return;
+        }
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return;
+        // Network error → fall through to client-side
       }
+    }
 
-      // ── Normal path: stream blob from server ─────────────────────────
-      setState({ status: 'downloading', progress: { percent: 50, speed: 'Streaming from server…', eta: 'Almost ready' } });
+    // ── Step 3: Client-side fallback (browser IP not blocked) ───────
+    setState({ status: 'downloading', progress: { percent: 30, speed: 'Using browser fallback…', eta: 'Please wait' } });
 
-      const blob = await response.blob();
-      if (controller.signal.aborted) return;
+    const ok = await clientSideDownload(
+      mediaUrl, formatId, isAudio, filename,
+      (msg) => setState({ status: 'downloading', progress: { percent: 50, speed: msg, eta: 'Please wait' } }),
+    );
 
-      const objectUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = objectUrl; a.download = filename; a.style.display = 'none';
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
-
+    if (ok) {
       setState({ status: 'complete', filename });
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') return;
-      console.error('[useDownload] error:', err);
-
-      // Network error — try client-side fallback
-      setState({ status: 'downloading', progress: { percent: 30, speed: 'Network error — using browser fallback…', eta: 'Please wait' } });
-      const ok = await clientSideDownload(mediaUrl, formatId, isAudio, filename,
-        (msg) => setState({ status: 'downloading', progress: { percent: 50, speed: msg, eta: 'Please wait' } })
-      );
-      if (ok) { setState({ status: 'complete', filename }); return; }
-
-      const knownError = ERROR_MESSAGES['NETWORK_ERROR'];
-      setState({ status: 'error', code: 'NETWORK_ERROR', message: 'Could not connect to the download server.', solution: knownError.solution });
+    } else {
+      setState({
+        status: 'error',
+        code: 'STREAM_UNAVAILABLE',
+        message: 'All download providers are currently unavailable.',
+        solution: 'Try again in a few minutes. The video may also be restricted.',
+      });
     }
   }, []);
 
