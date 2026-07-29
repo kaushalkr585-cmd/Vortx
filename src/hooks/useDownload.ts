@@ -1,8 +1,12 @@
 // ============================================================
-// VORTX — useDownload Hook (Real yt-dlp Backend Download)
+// VORTX — useDownload Hook (Production)
+// Uses fetch() instead of an <a> tag so HTTP errors from
+// /api/download are caught and surfaced as structured errors.
 // ============================================================
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
+import type { VortxErrorCode } from './useMediaInfo';
+import { ERROR_MESSAGES } from './useMediaInfo';
 
 export type DownloadProgress = {
   percent: number;
@@ -15,44 +19,12 @@ export type DownloadState =
   | { status: 'preparing' }
   | { status: 'downloading'; progress: DownloadProgress }
   | { status: 'complete'; filename: string }
-  | { status: 'error'; message: string };
-
-/** Build the backend download URL and trigger a real browser download */
-function triggerRealDownload(
-  mediaUrl: string,
-  formatId: string,
-  filename: string,
-  type: 'video' | 'audio',
-  audioQuality?: string
-) {
-  const params = new URLSearchParams({
-    url: mediaUrl,
-    format: formatId,
-    filename,
-    type,
-    ...(audioQuality ? { audioQuality } : {}),
-  });
-  const API_BASE = import.meta.env.VITE_API_BASE || '';
-  const downloadHref = `${API_BASE}/api/download?${params.toString()}`;
-  const a = document.createElement('a');
-  a.href = downloadHref;
-  a.download = filename;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-}
+  | { status: 'error'; message: string; code?: VortxErrorCode; solution?: string };
 
 export function useDownload() {
   const [state, setState] = useState<DownloadState>({ status: 'idle' });
+  const abortRef = useRef<AbortController | null>(null);
 
-  /**
-   * @param filename   — desired save filename (e.g. VORTX_MyVideo_1080p.mp4)
-   * @param formatId   — yt-dlp format string (e.g. "137+140" or "bestaudio/best")
-   * @param mediaUrl   — original video URL (YouTube, Instagram, etc.)
-   * @param type       — 'video' or 'audio'
-   * @param audioQuality — yt-dlp VBR quality ('0'=best, '9'=worst), for audio only
-   */
   const start = useCallback(async (
     filename: string,
     formatId: string,
@@ -60,36 +32,97 @@ export function useDownload() {
     type: 'video' | 'audio' = 'video',
     audioQuality?: string,
   ) => {
+    // Cancel any in-progress download
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setState({ status: 'preparing' });
 
-    // Brief preparing state so the UI updates before browser hands off the download
-    await new Promise((r) => setTimeout(r, 400));
+    const params = new URLSearchParams({
+      url: mediaUrl,
+      format: formatId,
+      filename,
+      type,
+      ...(audioQuality ? { audioQuality } : {}),
+    });
+
+    const API_BASE = import.meta.env.VITE_API_BASE || '';
+    const downloadUrl = `${API_BASE}/api/download?${params.toString()}`;
+
+    // Brief pause so the preparing state renders before the request blocks
+    await new Promise((r) => setTimeout(r, 350));
 
     try {
-      // Trigger the actual download — browser will start streaming from backend
-      triggerRealDownload(mediaUrl, formatId, filename, type, audioQuality);
-
-      // Show a "downloading" UI state while yt-dlp works
-      // We can't track progress without a WebSocket, so we show a pulsing state
       setState({
         status: 'downloading',
-        progress: { percent: 0, speed: 'Streaming…', eta: 'Please wait' },
+        progress: { percent: 0, speed: 'Contacting server…', eta: 'Please wait' },
       });
 
-      // Poll the download status via a short-lived fetch to /api/ping to confirm backend alive
-      await new Promise((r) => setTimeout(r, 1200));
+      const response = await window.fetch(downloadUrl, { signal: controller.signal });
+
+      if (!response.ok) {
+        // Try to parse structured error JSON from backend
+        let errorCode: VortxErrorCode = 'YTDLP_ERROR';
+        let errorMessage = 'Download failed. Please try again.';
+        let errorSolution = 'Check that the video is publicly available and try again.';
+
+        try {
+          const errBody = await response.json();
+          if (errBody && errBody.code) {
+            errorCode = errBody.code as VortxErrorCode;
+            errorMessage = errBody.message || errorMessage;
+            errorSolution = errBody.solution || errorSolution;
+          }
+        } catch { /* JSON parse failed — use defaults */ }
+
+        setState({ status: 'error', code: errorCode, message: errorMessage, solution: errorSolution });
+        return;
+      }
+
+      // Stream the response blob and trigger a browser download
+      setState({
+        status: 'downloading',
+        progress: { percent: 30, speed: 'Streaming from server…', eta: 'Almost ready' },
+      });
+
+      const blob = await response.blob();
+
+      if (controller.signal.aborted) return;
+
+      // Create an object URL and click it — this triggers the browser Save dialog
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke after a short delay to ensure the download starts
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
 
       setState({ status: 'complete', filename });
     } catch (err) {
+      if ((err as Error).name === 'AbortError') return; // User cancelled
       console.error('[useDownload] error:', err);
+
+      const knownError = ERROR_MESSAGES['NETWORK_ERROR'];
       setState({
         status: 'error',
-        message: 'Download failed. Make sure the backend server is running and yt-dlp is installed.',
+        code: 'NETWORK_ERROR',
+        message: 'Could not connect to the download server.',
+        solution: knownError.solution,
       });
     }
   }, []);
 
+  const cancel = useCallback(() => {
+    if (abortRef.current) abortRef.current.abort();
+    setState({ status: 'idle' });
+  }, []);
+
   const reset = useCallback(() => setState({ status: 'idle' }), []);
 
-  return { state, start, reset };
+  return { state, start, cancel, reset };
 }

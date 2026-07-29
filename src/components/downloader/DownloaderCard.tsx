@@ -1,10 +1,10 @@
 // ============================================================
-// VORTX — DownloaderCard (Premium Redesign)
+// VORTX — DownloaderCard (Production)
 // ============================================================
 
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { RotateCcw, Film, Music } from 'lucide-react';
+import { RotateCcw, Film, Music, AlertCircle, RefreshCw, Cookie, Clock, ShieldOff, Globe, Lock } from 'lucide-react';
 
 import { URLInput } from './URLInput';
 import { MediaPreview } from './MediaPreview';
@@ -15,12 +15,109 @@ import { MediaPreviewSkeleton, ResolutionSkeleton } from '../ui/LoadingSkeleton'
 import { ProgressModal } from '../ui/ProgressModal';
 
 import { useMediaInfo } from '../../hooks/useMediaInfo';
+import type { VortxErrorCode } from '../../hooks/useMediaInfo';
 import { useDownload } from '../../hooks/useDownload';
 
 type Tab = 'video' | 'audio';
 
+// ── Error icon map ────────────────────────────────────────────
+function ErrorIcon({ code }: { code?: VortxErrorCode }) {
+  const cls = 'flex-shrink-0';
+  switch (code) {
+    case 'BOT_DETECTED':     return <Cookie size={15} className={cls} />;
+    case 'RATE_LIMITED':     return <Clock size={15} className={cls} />;
+    case 'GEO_BLOCKED':      return <Globe size={15} className={cls} />;
+    case 'PRIVATE_VIDEO':
+    case 'MEMBERS_ONLY':     return <Lock size={15} className={cls} />;
+    case 'AGE_RESTRICTED':   return <ShieldOff size={15} className={cls} />;
+    default:                 return <AlertCircle size={15} className={cls} />;
+  }
+}
+
+// ── Inline error banner with solution and retry ───────────────
+function ErrorBanner({
+  message,
+  solution,
+  code,
+  onRetry,
+}: {
+  message: string;
+  solution?: string;
+  code?: VortxErrorCode;
+  onRetry?: () => void;
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: 'auto' }}
+      exit={{ opacity: 0, height: 0 }}
+      className="overflow-hidden"
+    >
+      <div
+        style={{
+          marginTop: '12px',
+          padding: '14px 16px',
+          borderRadius: '12px',
+          background: 'rgba(255, 80, 80, 0.08)',
+          border: '1px solid rgba(255, 80, 80, 0.22)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+        }}
+      >
+        {/* Title row */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+          <span style={{ color: 'rgba(255, 120, 120, 0.9)', marginTop: '1px' }}>
+            <ErrorIcon code={code} />
+          </span>
+          <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'rgba(255,255,255,0.9)', lineHeight: 1.4 }}>
+            {message}
+          </span>
+        </div>
+
+        {/* Solution hint */}
+        {solution && (
+          <p style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.45)', paddingLeft: '25px', lineHeight: 1.5, margin: 0 }}>
+            {solution}
+          </p>
+        )}
+
+        {/* Retry button */}
+        {onRetry && (
+          <div style={{ paddingLeft: '25px' }}>
+            <button
+              onClick={onRetry}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                fontSize: '0.72rem',
+                fontWeight: 600,
+                color: 'rgba(255,255,255,0.7)',
+                background: 'rgba(255,255,255,0.07)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: '7px',
+                padding: '5px 12px',
+                cursor: 'pointer',
+                transition: 'background 0.15s',
+              }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.12)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.07)')}
+            >
+              <RefreshCw size={11} />
+              Try Again
+            </button>
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 export function DownloaderCard() {
   const [url, setUrl] = useState('');
+  const [lastUrl, setLastUrl] = useState('');
   const [activeTab, setActiveTab] = useState<Tab>('video');
   const [selectedVideoId, setSelectedVideoId] = useState<string | null>(null);
   const [selectedAudioId, setSelectedAudioId] = useState<string | null>(null);
@@ -32,12 +129,21 @@ export function DownloaderCard() {
 
   const handleSubmit = useCallback(
     async (inputUrl: string) => {
+      setLastUrl(inputUrl);
       setSelectedVideoId(null);
       setSelectedAudioId(null);
       await fetchMedia(inputUrl);
     },
     [fetchMedia]
   );
+
+  const handleRetry = useCallback(() => {
+    if (lastUrl) {
+      setSelectedVideoId(null);
+      setSelectedAudioId(null);
+      fetchMedia(lastUrl);
+    }
+  }, [lastUrl, fetchMedia]);
 
   useEffect(() => {
     if (mediaState.status === 'success') {
@@ -50,6 +156,7 @@ export function DownloaderCard() {
 
   const handleReset = () => {
     setUrl('');
+    setLastUrl('');
     setSelectedVideoId(null);
     setSelectedAudioId(null);
     resetMedia();
@@ -105,20 +212,27 @@ export function DownloaderCard() {
             loading={mediaState.status === 'loading'}
           />
 
-          {/* ── Error ── */}
+          {/* ── Error banner ── */}
           <AnimatePresence>
             {mediaState.status === 'error' && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
-              >
-                <div className="error-banner">
-                  <span className="error-dot" />
-                  {mediaState.message}
-                </div>
-              </motion.div>
+              <ErrorBanner
+                message={mediaState.message}
+                solution={mediaState.solution}
+                code={mediaState.code}
+                onRetry={lastUrl ? handleRetry : undefined}
+              />
+            )}
+          </AnimatePresence>
+
+          {/* ── Download error banner ── */}
+          <AnimatePresence>
+            {dlState.status === 'error' && (
+              <ErrorBanner
+                message={dlState.message}
+                solution={dlState.solution}
+                code={dlState.code}
+                onRetry={handleDownload}
+              />
             )}
           </AnimatePresence>
 

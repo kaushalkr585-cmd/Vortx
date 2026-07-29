@@ -10,9 +10,11 @@ type Props = {
   state: DownloadState;
   filename: string;
   onClose: () => void;
+  onCancel?: () => void;
 };
 
-export function ProgressModal({ state, filename, onClose }: Props) {
+export function ProgressModal({ state, filename, onClose, onCancel: _onCancel }: Props) {
+  // Error state is handled inline in DownloaderCard — modal only shows for active/complete states
   const isOpen =
     state.status === 'preparing' ||
     state.status === 'downloading' ||

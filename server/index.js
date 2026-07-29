@@ -1,16 +1,16 @@
 // ============================================================
-// VORTX Backend Server — Real yt-dlp Streaming
+// VORTX Backend Server — Production-Grade yt-dlp Engine
 // Port: 3001
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
-// Resolve local ffmpeg binary path from @ffmpeg-installer/ffmpeg
+// ─── FFmpeg Resolution ────────────────────────────────────────
 let ffmpegPath = null;
 try {
   const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
@@ -28,122 +28,400 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json());
 
-// ─── Health Check ────────────────────────────────────────────
-app.get('/api/ping', (_req, res) => {
-  res.json({ status: 'ok', engine: 'VORTX yt-dlp backend v1.0', ffmpeg: !!ffmpegPath });
-});
+// ─── In-Memory Metadata Cache (5-min TTL) ────────────────────
+const metaCache = new Map(); // key: cleanUrl → { data, expires }
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
-// Standard resolution presets for clean UX
+function getCached(key) {
+  const entry = metaCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) { metaCache.delete(key); return null; }
+  return entry.data;
+}
+function setCache(key, data) {
+  metaCache.set(key, { data, expires: Date.now() + CACHE_TTL_MS });
+  // Prune cache if over 50 entries
+  if (metaCache.size > 50) {
+    const firstKey = metaCache.keys().next().value;
+    metaCache.delete(firstKey);
+  }
+}
+
+// ─── Standard Resolution Presets ─────────────────────────────
 const STANDARD_RESOLUTIONS = [
-  { height: 144, label: '144p', resolution: '256×144', estimatedSize: '12 MB' },
-  { height: 240, label: '240p', resolution: '426×240', estimatedSize: '24 MB' },
-  { height: 360, label: '360p', resolution: '640×360', estimatedSize: '45 MB' },
-  { height: 480, label: '480p', resolution: '854×480', estimatedSize: '78 MB' },
-  { height: 720, label: '720p HD', resolution: '1280×720', estimatedSize: '135 MB' },
-  { height: 1080, label: '1080p Full HD', resolution: '1920×1080', estimatedSize: '220 MB', recommended: true },
-  { height: 1440, label: '1440p 2K', resolution: '2560×1440', estimatedSize: '410 MB' },
-  { height: 2160, label: '2160p 4K', resolution: '3840×2160', estimatedSize: '1.1 GB', hdr: true },
+  { height: 144,  label: '144p',           resolution: '256×144',    estimatedSize: '12 MB' },
+  { height: 240,  label: '240p',           resolution: '426×240',    estimatedSize: '24 MB' },
+  { height: 360,  label: '360p',           resolution: '640×360',    estimatedSize: '45 MB' },
+  { height: 480,  label: '480p',           resolution: '854×480',    estimatedSize: '78 MB' },
+  { height: 720,  label: '720p HD',        resolution: '1280×720',   estimatedSize: '135 MB' },
+  { height: 1080, label: '1080p Full HD',  resolution: '1920×1080',  estimatedSize: '220 MB', recommended: true },
+  { height: 1440, label: '1440p 2K',       resolution: '2560×1440',  estimatedSize: '410 MB' },
+  { height: 2160, label: '2160p 4K',       resolution: '3840×2160',  estimatedSize: '1.1 GB', hdr: true },
 ];
 
-// Helper function to resolve cookies from YOUTUBE_COOKIES env var or cookies.txt file
+// ─── Cookie Resolution ────────────────────────────────────────
+/**
+ * Returns the path to a valid YouTube Netscape cookie file, or null.
+ * Priority:
+ *   1. YOUTUBE_COOKIES env var (paste the cookie file contents here for cloud)
+ *   2. server/cookies.txt  (local development)
+ *   3. cookies.txt in project root
+ */
 function getCookiesPath() {
-  if (process.env.YOUTUBE_COOKIES && process.env.YOUTUBE_COOKIES.trim().length > 0) {
+  const envCookies = process.env.YOUTUBE_COOKIES;
+  if (envCookies && envCookies.trim().length > 0) {
     try {
       const envPath = path.join(os.tmpdir(), 'vortx_yt_cookies.txt');
-      fs.writeFileSync(envPath, process.env.YOUTUBE_COOKIES.trim());
+      fs.writeFileSync(envPath, envCookies.trim(), 'utf8');
+      console.log('[COOKIES] Loaded cookies from YOUTUBE_COOKIES env var');
       return envPath;
     } catch (e) {
-      console.error('[COOKIES] Failed to write YOUTUBE_COOKIES env var to file:', e);
+      console.error('[COOKIES] Failed to write YOUTUBE_COOKIES env to file:', e.message);
     }
   }
 
-  return [
+  const candidates = [
     path.join(__dirname, 'cookies.txt'),
     path.join(__dirname, '../cookies.txt'),
-  ].find(p => fs.existsSync(p)) || null;
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      try {
+        const content = fs.readFileSync(p, 'utf8');
+        // Validate it contains YouTube authentication cookies
+        // yt-dlp normalizes SAPISID → __Secure-3PAPISID when writing the file
+        const hasYT = content.includes('youtube.com');
+        const hasAuth = content.includes('__Secure-3PAPISID') ||
+                        content.includes('SAPISID') ||
+                        content.includes('__Secure-3PSID');
+        if (hasYT && hasAuth) {
+          console.log(`[COOKIES] Using cookie file: ${p}`);
+          return p;
+        }
+      } catch { /* skip */ }
+    }
+  }
+  return null;
 }
 
-// Helper function to sanitize YouTube URLs by removing playlist & mix tracking parameters
+// ─── URL Validation & Sanitization ───────────────────────────
+const ALLOWED_HOSTS = [
+  'youtube.com', 'www.youtube.com', 'youtu.be',
+  'm.youtube.com', 'music.youtube.com',
+  'instagram.com', 'www.instagram.com',
+];
+
+function validateUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  // Strip whitespace
+  const trimmed = rawUrl.trim();
+  if (trimmed.length > 2048) return null;
+  // Block shell injection patterns
+  if (/[;&|`$<>{}[\]\\]/.test(trimmed)) return null;
+  try {
+    const parsed = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
+    const host = parsed.hostname.toLowerCase();
+    const allowed = ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h));
+    if (!allowed) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
 function sanitizeUrl(rawUrl) {
   if (!rawUrl) return rawUrl;
   try {
     const parsed = new URL(rawUrl);
     if (parsed.hostname.includes('youtube.com') && parsed.searchParams.has('v')) {
       const videoId = parsed.searchParams.get('v');
-      return `https://www.youtube.com/watch?v=${videoId}`;
+      if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+        return `https://www.youtube.com/watch?v=${videoId}`;
+      }
     }
-  } catch (e) {
-    // If URL parsing fails, return raw string
-  }
+  } catch { /* fall through */ }
   return rawUrl;
 }
 
-// ─── /api/info ───────────────────────────────────────────────
-// Returns yt-dlp JSON metadata for a given URL
-app.get('/api/info', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'Missing url parameter' });
+// ─── Error Code Parser ────────────────────────────────────────
+/**
+ * Parses raw yt-dlp stderr text into a structured { code, message, solution } object.
+ */
+function parseYtdlpError(stderr) {
+  const s = stderr || '';
 
-  const cleanUrl = sanitizeUrl(url);
-  console.log(`[INFO] Fetching metadata for: ${cleanUrl} (raw: ${url})`);
+  if (/Sign in to confirm|not a bot|bot detection/i.test(s)) {
+    return {
+      code: 'BOT_DETECTED',
+      message: 'YouTube requires authentication to verify this request is from a real user.',
+      solution: 'Your session cookies need to be refreshed. Export fresh cookies from your browser and update the YOUTUBE_COOKIES environment variable.',
+    };
+  }
+  if (/Private video|This video is private/i.test(s)) {
+    return {
+      code: 'PRIVATE_VIDEO',
+      message: 'This video is private and cannot be downloaded.',
+      solution: 'Only the video owner can access private videos. Try a public video instead.',
+    };
+  }
+  if (/members.only|join this channel/i.test(s)) {
+    return {
+      code: 'MEMBERS_ONLY',
+      message: 'This video is for channel members only.',
+      solution: 'You need to be a member of this channel to download this video.',
+    };
+  }
+  if (/age.restricted|confirm your age|inappropriate/i.test(s)) {
+    return {
+      code: 'AGE_RESTRICTED',
+      message: 'This video is age-restricted.',
+      solution: 'Age-restricted videos require verified account cookies. Ensure your Google account has age verification enabled.',
+    };
+  }
+  if (/not available in your country|geo.?block|geo.?restrict/i.test(s)) {
+    return {
+      code: 'GEO_BLOCKED',
+      message: 'This video is not available in the server\'s region.',
+      solution: 'This content is geo-restricted. Try a video available in your region.',
+    };
+  }
+  if (/live.?stream|is live|live event/i.test(s)) {
+    return {
+      code: 'LIVE_STREAM',
+      message: 'Live streams cannot be downloaded while they are active.',
+      solution: 'Wait until the stream ends, then the video will be available for download.',
+    };
+  }
+  if (/video.?unavailable|has been removed|no longer available/i.test(s)) {
+    return {
+      code: 'VIDEO_UNAVAILABLE',
+      message: 'This video has been removed or is no longer available.',
+      solution: 'The video may have been deleted by the uploader or removed by YouTube.',
+    };
+  }
+  if (/copyright|content.?id/i.test(s)) {
+    return {
+      code: 'COPYRIGHT_BLOCKED',
+      message: 'This video is blocked due to a copyright claim.',
+      solution: 'The content owner has restricted downloads for this video.',
+    };
+  }
+  if (/429|Too Many Requests|rate.?limit/i.test(s)) {
+    return {
+      code: 'RATE_LIMITED',
+      message: 'Too many requests sent to YouTube. Please wait a moment.',
+      solution: 'YouTube has temporarily limited requests from this server. Wait 1-2 minutes and try again.',
+    };
+  }
+  if (/No such file|ffmpeg|merger|postprocessor/i.test(s)) {
+    return {
+      code: 'FFMPEG_MISSING',
+      message: 'FFmpeg is required for merging video and audio streams.',
+      solution: 'FFmpeg is not installed or not found. Contact the server administrator.',
+    };
+  }
+  if (/Unable to extract|Failed to extract|ExtractorError/i.test(s)) {
+    return {
+      code: 'EXTRACTOR_ERROR',
+      message: 'Failed to extract video information from this URL.',
+      solution: 'This may be a temporary YouTube issue. Try again in a few seconds, or check if yt-dlp needs to be updated.',
+    };
+  }
+  if (/network|Connection|timeout|SSL/i.test(s)) {
+    return {
+      code: 'NETWORK_ERROR',
+      message: 'A network error occurred while contacting YouTube.',
+      solution: 'Check the server\'s network connection and try again.',
+    };
+  }
 
-  const cookiesPath = getCookiesPath();
+  return {
+    code: 'YTDLP_ERROR',
+    message: 'yt-dlp encountered an error processing this video.',
+    solution: 'Check that the URL is valid and the video is publicly accessible.',
+  };
+}
 
+// ─── Shared yt-dlp Args Builder ───────────────────────────────
+/**
+ * Returns the base yt-dlp arguments that apply to both /api/info and /api/download.
+ * These mimic a real browser session as closely as possible.
+ */
+function buildBaseArgs(cookiesPath) {
   const args = [
     '--no-playlist',
     '--no-warnings',
-    '--dump-json',
-    '--quiet',
+    // Realistic Chrome 126 user agent
+    '--user-agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    // Add HTTP headers that real browsers send
+    '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    // JS runtime for YouTube n-challenge decryption (required by yt-dlp 2026.07+)
+    // Without these two flags, yt-dlp cannot decrypt CDN URLs and fails with
+    // "Requested format is not available" — they are NOT optional.
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    // Retry & resilience
+    '--retries', '3',
+    '--extractor-retries', '3',
+    '--fragment-retries', '3',
+    '--retry-sleep', 'linear=1::2',
+    // Polite request pacing to avoid triggering rate-limit
+    '--sleep-requests', '1',
+    '--sleep-interval', '2',
+    // Bypass geographic restrictions
+    '--geo-bypass',
+    // Skip HTTPS certificate errors (some VPS have outdated certs)
+    '--no-check-certificates',
   ];
 
   if (cookiesPath) {
     args.push('--cookies', cookiesPath);
   }
 
-  args.push(cleanUrl);
+  return args;
+}
+
+// ─── Health Check ─────────────────────────────────────────────
+app.get('/api/ping', (_req, res) => {
+  res.json({ status: 'ok', engine: 'VORTX yt-dlp backend v2.0', ffmpeg: !!ffmpegPath });
+});
+
+// ─── /api/health ──────────────────────────────────────────────
+app.get('/api/health', (_req, res) => {
+  let ytdlpVersion = 'unknown';
+  try { ytdlpVersion = execSync('yt-dlp --version', { timeout: 5000 }).toString().trim(); } catch {}
+
+  const cookiesPath = getCookiesPath();
+  const hasCookies = !!cookiesPath;
+
+  let cookiesValid = false;
+  if (hasCookies) {
+    try {
+      const content = fs.readFileSync(cookiesPath, 'utf8');
+      cookiesValid = content.includes('youtube.com') &&
+        (content.includes('__Secure-3PAPISID') || content.includes('SAPISID') || content.includes('__Secure-3PSID'));
+    } catch {}
+  }
+
+  res.json({
+    status: 'ok',
+    ytdlpVersion,
+    ffmpegBundled: !!ffmpegPath,
+    ffmpegPath: ffmpegPath || 'system PATH',
+    hasCookies,
+    cookiesValid,
+    cacheSize: metaCache.size,
+    uptime: Math.floor(process.uptime()),
+  });
+});
+
+// ─── /api/cookies/status ──────────────────────────────────────
+app.get('/api/cookies/status', (_req, res) => {
+  const cookiesPath = getCookiesPath();
+  if (!cookiesPath) {
+    return res.json({
+      configured: false,
+      message: 'No YouTube cookies found. Bot detection may block some videos.',
+    });
+  }
+  try {
+    const content = fs.readFileSync(cookiesPath, 'utf8');
+    const hasCore = content.includes('youtube.com') &&
+      (content.includes('__Secure-3PAPISID') || content.includes('SAPISID') || content.includes('__Secure-3PSID'));
+    return res.json({
+      configured: true,
+      valid: hasCore,
+      message: hasCore ? 'Cookies are configured and appear valid.' : 'Cookie file found but may be incomplete.',
+    });
+  } catch {
+    return res.json({ configured: false, message: 'Cookie file could not be read.' });
+  }
+});
+
+// ─── /api/info ────────────────────────────────────────────────
+app.get('/api/info', async (req, res) => {
+  const rawUrl = req.query.url;
+  if (!rawUrl) return res.status(400).json({ success: false, code: 'MISSING_URL', message: 'Missing url parameter.' });
+
+  const validUrl = validateUrl(rawUrl);
+  if (!validUrl) {
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_URL',
+      message: 'The URL you entered is not a supported video link.',
+      solution: 'Please use a valid YouTube or Instagram URL.',
+    });
+  }
+
+  const cleanUrl = sanitizeUrl(validUrl);
+  console.log(`[INFO] ${cleanUrl}`);
+
+  // Cache hit
+  const cached = getCached(cleanUrl);
+  if (cached) {
+    console.log(`[INFO] Cache hit for: ${cleanUrl}`);
+    return res.json(cached);
+  }
+
+  const cookiesPath = getCookiesPath();
+  const args = [
+    ...buildBaseArgs(cookiesPath),
+    '--dump-json',
+    '--quiet',
+    cleanUrl,
+  ];
 
   const proc = spawn('yt-dlp', args);
   let rawData = '';
   let errData = '';
 
-  proc.stdout.on('data', (chunk) => { rawData += chunk.toString(); });
-  proc.stderr.on('data', (chunk) => { errData += chunk.toString(); });
+  proc.stdout.on('data', chunk => { rawData += chunk.toString(); });
+  proc.stderr.on('data', chunk => { errData += chunk.toString(); });
 
   proc.on('error', (err) => {
     console.error('[INFO] Failed to spawn yt-dlp:', err.message);
     if (!res.headersSent) {
-      res.status(500).json({
-        error: 'yt-dlp is not installed or not found in PATH. Run: pip install yt-dlp',
+      res.status(503).json({
+        success: false,
+        code: 'YTDLP_NOT_FOUND',
+        message: 'yt-dlp is not installed on the server.',
+        solution: 'Run: pip install yt-dlp',
+        details: err.message,
       });
     }
   });
 
   proc.on('close', (code) => {
     if (code !== 0) {
-      console.error(`[INFO] yt-dlp exited ${code}: ${errData}`);
-      return res.status(500).json({ error: errData.trim() || 'yt-dlp failed to fetch info' });
+      console.error(`[INFO] yt-dlp exited ${code}: ${errData.slice(0, 500)}`);
+      const parsed = parseYtdlpError(errData);
+      if (!res.headersSent) {
+        return res.status(422).json({
+          success: false,
+          ...parsed,
+          details: errData.trim().slice(0, 300),
+        });
+      }
+      return;
     }
+
     try {
       const data = JSON.parse(rawData);
 
-      // Build structured format list from yt-dlp formats array
+      // ── Build format list ──────────────────────────────────
       const rawFormats = Array.isArray(data.formats) ? data.formats : [];
 
-      // Collect unique heights available from video streams
       const heightSet = new Set();
       for (const f of rawFormats) {
         if (!f.vcodec || f.vcodec === 'none') continue;
         if (f.height) heightSet.add(f.height);
       }
-
       if (data.height) heightSet.add(data.height);
 
       const maxHeight = heightSet.size > 0 ? Math.max(...heightSet) : 1080;
 
-      // Map sizes per height
       const sizeByHeight = new Map();
       for (const f of rawFormats) {
         if (!f.vcodec || f.vcodec === 'none') continue;
@@ -153,7 +431,7 @@ app.get('/api/info', async (req, res) => {
         if (size > existing) sizeByHeight.set(f.height, size);
       }
 
-      const targetHeights = heightSet.size > 0
+      let targetHeights = heightSet.size > 0
         ? [...heightSet].sort((a, b) => a - b)
         : STANDARD_RESOLUTIONS.filter(r => r.height <= maxHeight).map(r => r.height);
 
@@ -174,7 +452,6 @@ app.get('/api/info', async (req, res) => {
         ? `${Math.floor(durationSecs / 60)}:${String(durationSecs % 60).padStart(2, '0')}`
         : '—';
 
-      // Dynamic size calculation helper based on duration and resolution bitrate
       const estimateSizeString = (sizeBytes, height) => {
         let bytes = sizeBytes;
         if (!bytes || bytes === 0) {
@@ -197,10 +474,7 @@ app.get('/api/info', async (req, res) => {
         const sizeBytes = sizeByHeight.get(height) || 0;
         const sizeStr = estimateSizeString(sizeBytes, height);
         const width = Math.round((height * 16) / 9);
-
-        // Robust format selector prioritizing requested resolution with optional height matching
         const fmt = `bestvideo[height<=?${height}]+bestaudio/bestvideo+bestaudio/best`;
-
         return {
           id: fmt,
           label: LABEL_MAP[height] || `${height}p`,
@@ -214,7 +488,6 @@ app.get('/api/info', async (req, res) => {
         };
       });
 
-      // Audio formats with dynamic size based on duration
       const estimateAudioSize = (bitrateKbps) => {
         if (!durationSecs || durationSecs === 0) return '10 MB';
         const bytes = Math.round(((bitrateKbps * 1000) / 8) * durationSecs);
@@ -235,13 +508,9 @@ app.get('/api/info', async (req, res) => {
           ? data.thumbnails[data.thumbnails.length - 1].url
           : null);
 
-      const durationSecs = data.duration || 0;
-      const durationStr = durationSecs > 0
-        ? `${Math.floor(durationSecs / 60)}:${String(durationSecs % 60).padStart(2, '0')}`
-        : '—';
-
-      res.json({
-        url,
+      const response = {
+        success: true,
+        url: rawUrl,
         title: data.title || 'Untitled',
         uploader: data.uploader || data.channel || 'Unknown',
         uploaderAvatar: `https://api.dicebear.com/7.x/identicon/svg?seed=${encodeURIComponent(data.uploader || 'vortx')}`,
@@ -254,44 +523,54 @@ app.get('/api/info', async (req, res) => {
         platform: data.extractor_key ? data.extractor_key.toLowerCase() : 'unknown',
         videoFormats: videoFormats.length > 0 ? videoFormats : null,
         audioFormats,
-      });
+      };
+
+      setCache(cleanUrl, response);
+      res.json(response);
     } catch (parseErr) {
       console.error('[INFO] JSON parse error:', parseErr);
-      res.status(500).json({ error: 'Failed to parse yt-dlp output' });
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          code: 'PARSE_ERROR',
+          message: 'Failed to parse video metadata from yt-dlp.',
+          solution: 'This is a server-side error. Please report it.',
+          details: parseErr.message,
+        });
+      }
     }
   });
 });
 
-// ─── /api/download ───────────────────────────────────────────
-// Downloads via yt-dlp to a temp file, merges video+audio using ffmpeg,
-// then streams the finished file to the browser and cleans up.
+// ─── /api/download ────────────────────────────────────────────
 app.get('/api/download', (req, res) => {
-  const { url, format, filename, type, audioQuality } = req.query;
-  if (!url) return res.status(400).json({ error: 'Missing url parameter' });
+  const { url: rawUrl, format, filename, type, audioQuality } = req.query;
+
+  if (!rawUrl) {
+    return res.status(400).json({ success: false, code: 'MISSING_URL', message: 'Missing url parameter.' });
+  }
+
+  const validUrl = validateUrl(rawUrl);
+  if (!validUrl) {
+    return res.status(400).json({
+      success: false, code: 'INVALID_URL',
+      message: 'The URL you entered is not supported.',
+    });
+  }
 
   const isAudio = type === 'audio';
   const safeFilename = (filename || (isAudio ? 'audio.mp3' : 'video.mp4'))
-    .replace(/[^\w\-. ()]/g, '_');
+    .replace(/[^\w\-. ()]/g, '_')
+    .slice(0, 200);
 
   const fileId = `vortx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const tmpTemplate = path.join(os.tmpdir(), `${fileId}.%(ext)s`);
+  const cleanUrl = sanitizeUrl(validUrl);
 
-  const cleanUrl = sanitizeUrl(url);
-  console.log(`[DOWNLOAD] cleanUrl=${cleanUrl} (raw=${url}) format=${format} type=${type} file=${safeFilename}`);
-
-  const args = [
-    '--no-playlist',
-    '--no-warnings',
-    '--js-runtimes', 'node',
-    '--remote-components', 'ejs:github',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  ];
+  console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
 
   const cookiesPath = getCookiesPath();
-  if (cookiesPath) {
-    console.log(`[DOWNLOAD] Using cookies file from: ${cookiesPath}`);
-    args.push('--cookies', cookiesPath);
-  }
+  const args = [...buildBaseArgs(cookiesPath)];
 
   if (ffmpegPath) {
     args.push('--ffmpeg-location', ffmpegPath);
@@ -299,9 +578,8 @@ app.get('/api/download', (req, res) => {
 
   if (isAudio) {
     const quality = audioQuality || '2';
-    const audioFmt = 'bestaudio/best';
     args.push(
-      '-f', audioFmt,
+      '-f', 'bestaudio/best',
       '--extract-audio',
       '--audio-format', 'mp3',
       '--audio-quality', quality,
@@ -309,7 +587,6 @@ app.get('/api/download', (req, res) => {
       cleanUrl
     );
   } else {
-    // Extract target height if present and construct optional height matching selector
     let targetFmt = 'bv*+ba/b';
     if (format) {
       const match = format.match(/height<=?\??(\d+)/);
@@ -320,7 +597,7 @@ app.get('/api/download', (req, res) => {
         targetFmt = `${format}/bv*+ba/b`;
       }
     }
-    console.log(`[DOWNLOAD] Resolved targetFmt: ${targetFmt}`);
+    console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
     args.push(
       '-f', targetFmt,
       '--merge-output-format', 'mp4',
@@ -330,17 +607,20 @@ app.get('/api/download', (req, res) => {
   }
 
   const proc = spawn('yt-dlp', args);
+  let errOutput = '';
 
   proc.on('error', (err) => {
     console.error('[DOWNLOAD] Failed to spawn yt-dlp:', err.message);
     if (!res.headersSent) {
-      res.status(500).json({
-        error: 'yt-dlp is not installed or not found in PATH.',
+      res.status(503).json({
+        success: false,
+        code: 'YTDLP_NOT_FOUND',
+        message: 'yt-dlp is not installed on the server.',
+        solution: 'Run: pip install yt-dlp',
       });
     }
   });
 
-  let errOutput = '';
   proc.stderr.on('data', (chunk) => {
     const msg = chunk.toString();
     errOutput += msg;
@@ -349,28 +629,37 @@ app.get('/api/download', (req, res) => {
 
   proc.on('close', (code) => {
     if (code !== 0) {
-      console.error(`[DOWNLOAD] yt-dlp exited with code ${code}:\n${errOutput}`);
+      console.error(`[DOWNLOAD] yt-dlp exited ${code}`);
       if (!res.headersSent) {
-        res.status(500).json({ error: errOutput.trim() || 'yt-dlp download failed' });
+        const parsed = parseYtdlpError(errOutput);
+        res.status(422).json({
+          success: false,
+          ...parsed,
+          details: errOutput.trim().slice(0, 300),
+        });
       }
       return;
     }
 
-    // Locate the exact file produced by yt-dlp with prefix `fileId`
     const tmpDir = os.tmpdir();
     let matchingFiles = [];
     try {
       matchingFiles = fs.readdirSync(tmpDir).filter(
-        (f) => f.startsWith(fileId) && !f.endsWith('.part') && !f.endsWith('.ytdl')
+        f => f.startsWith(fileId) && !f.endsWith('.part') && !f.endsWith('.ytdl')
       );
     } catch (e) {
       console.error('[DOWNLOAD] Failed to read temp directory:', e);
     }
 
     if (matchingFiles.length === 0) {
-      console.error('[DOWNLOAD] Temp file not found for prefix:', fileId);
+      console.error('[DOWNLOAD] No output file found for prefix:', fileId);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Output file was not generated by yt-dlp.' });
+        res.status(500).json({
+          success: false,
+          code: 'OUTPUT_MISSING',
+          message: 'Download completed but output file was not found.',
+          solution: 'This may be a server disk space or permissions issue.',
+        });
       }
       return;
     }
@@ -379,15 +668,17 @@ app.get('/api/download', (req, res) => {
 
     fs.stat(actualFilePath, (statErr, stat) => {
       if (statErr || !stat) {
-        console.error('[DOWNLOAD] Temp file stat error:', statErr);
         if (!res.headersSent) {
-          res.status(500).json({ error: 'Failed to access generated download file.' });
+          res.status(500).json({
+            success: false,
+            code: 'FILE_STAT_ERROR',
+            message: 'Failed to access the downloaded file.',
+          });
         }
         return;
       }
 
-      console.log(`[DOWNLOAD] Streaming ${stat.size} bytes (${matchingFiles[0]}) → ${safeFilename}`);
-
+      console.log(`[DOWNLOAD] Streaming ${stat.size} bytes → ${safeFilename}`);
       res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
       res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
       res.setHeader('Content-Length', stat.size);
@@ -397,10 +688,9 @@ app.get('/api/download', (req, res) => {
 
       const cleanup = () => {
         fs.unlink(actualFilePath, (err) => {
-          if (!err) console.log(`[DOWNLOAD] Cleaned up temp file: ${actualFilePath}`);
+          if (!err) console.log(`[DOWNLOAD] Cleaned up: ${actualFilePath}`);
         });
       };
-
       readStream.on('close', cleanup);
       readStream.on('error', (err) => {
         console.error('[DOWNLOAD] Read stream error:', err);
@@ -409,13 +699,10 @@ app.get('/api/download', (req, res) => {
     });
   });
 
-  // Handle client abort
-  req.on('close', () => {
-    proc.kill('SIGTERM');
-  });
+  req.on('close', () => { proc.kill('SIGTERM'); });
 });
 
-// Serve frontend production build if present (Combined Deployment)
+// ─── Serve Frontend ───────────────────────────────────────────
 const distPath = path.join(__dirname, '../dist');
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
@@ -425,12 +712,16 @@ if (fs.existsSync(distPath)) {
   });
 }
 
-// ─── Start ───────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────
 app.listen(PORT, () => {
+  const cookiesPath = getCookiesPath();
   console.log(`\n🚀 VORTX backend running at http://localhost:${PORT}`);
-  console.log(`   FFmpeg bundled: ${ffmpegPath ? 'YES (' + ffmpegPath + ')' : 'NO'}`);
+  console.log(`   FFmpeg  : ${ffmpegPath ? 'BUNDLED (' + ffmpegPath + ')' : 'system PATH'}`);
+  console.log(`   Cookies : ${cookiesPath ? '✓ LOADED (' + cookiesPath + ')' : '✗ NOT CONFIGURED (bot detection risk)'}`);
   console.log(`   Endpoints:`);
   console.log(`     GET /api/ping`);
+  console.log(`     GET /api/health`);
+  console.log(`     GET /api/cookies/status`);
   console.log(`     GET /api/info?url=<video_url>`);
-  console.log(`     GET /api/download?url=<video_url>&format=<fmt>&filename=<name>&type=video|audio\n`);
+  console.log(`     GET /api/download?url=<video_url>&format=<fmt>&type=video|audio\n`);
 });

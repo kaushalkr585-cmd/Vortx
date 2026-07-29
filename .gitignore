@@ -16,6 +16,11 @@ build/
 .env.production.local
 *.env
 
+# YouTube cookies — NEVER commit these (contain live session tokens)
+cookies.txt
+server/cookies.txt
+*.cookies.txt
+
 # Temporary media & yt-dlp download files
 *.mp4
 *.webm
