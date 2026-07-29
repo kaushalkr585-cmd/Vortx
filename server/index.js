@@ -992,13 +992,6 @@ app.get('/api/stream', async (req, res) => {
 
   const safeFilename = filename.replace(/[^\w\-. ()]/g, '_').slice(0, 200);
 
-  const streamUrl = await resolveYouTubeStreamUrl(videoId, isAudio, height);
-  if (streamUrl) {
-    const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
-    if (ok) return;
-  }
-
-  // Fallback if direct stream proxy unavailable
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const downloadExtraArgs = [];
   if (ffmpegPath) downloadExtraArgs.push('--ffmpeg-location', ffmpegPath);
@@ -1018,6 +1011,7 @@ app.get('/api/stream', async (req, res) => {
     downloadExtraArgs.push(
       '-f', `bv*[height<=?${height}]+ba/b[height<=?${height}]/bv*+ba/b/best`,
       '--merge-output-format', 'mp4',
+      '--remux-video', 'mp4',
       '-o', tmpTemplate,
       cleanUrl
     );
@@ -1041,11 +1035,22 @@ app.get('/api/stream', async (req, res) => {
     return res.status(500).json({ success: false, code: 'OUTPUT_MISSING', message: 'Download completed but output missing.' });
   }
 
-  const actualFilePath = path.join(tmpDir, matchingFiles[0]);
+  const actualFileName = matchingFiles[0];
+  const actualFilePath = path.join(tmpDir, actualFileName);
+  const ext = path.extname(actualFileName).toLowerCase();
+
+  let contentType = isAudio ? 'audio/mpeg' : 'video/mp4';
+  if (ext === '.webm') contentType = 'video/webm';
+  else if (ext === '.mkv') contentType = 'video/x-matroska';
+  else if (ext === '.mp3') contentType = 'audio/mpeg';
+
+  const baseName = safeFilename.replace(/\.[^/.]+$/, '');
+  const finalFilename = `${baseName}${ext}`;
+
   const stat = fs.statSync(actualFilePath);
 
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-  res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+  res.setHeader('Content-Disposition', `attachment; filename="${finalFilename}"`);
+  res.setHeader('Content-Type', contentType);
   res.setHeader('Content-Length', stat.size);
 
   const readStream = fs.createReadStream(actualFilePath);
@@ -1088,29 +1093,7 @@ app.get('/api/download', async (req, res) => {
 
   console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
 
-  // ── FAST PATH for YouTube: parallel race of all providers (no yt-dlp needed) ──
-  if (isYouTube && videoId) {
-    let targetHeight = 720;
-    if (format) {
-      const m = format.match(/height<=?\??(\d+)/);
-      if (m && m[1]) targetHeight = parseInt(m[1]);
-    }
-
-    console.log(`[DOWNLOAD] Racing stream providers for videoId=${videoId}...`);
-    const streamUrl = await resolveYouTubeStreamUrl(videoId, isAudio, targetHeight);
-
-    if (streamUrl) {
-      const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
-      if (ok) {
-        console.log('[DOWNLOAD] ✓ Stream proxy complete');
-        return;
-      }
-    }
-
-    console.log('[DOWNLOAD] Fast-path stream proxy unavailable. Falling back to server-side yt-dlp download...');
-  }
-
-  // Non-YouTube (Instagram etc.) — use yt-dlp
+  // Use yt-dlp directly for full quality merged downloads
   const downloadExtraArgs = [];
   if (ffmpegPath) downloadExtraArgs.push('--ffmpeg-location', ffmpegPath);
 
@@ -1139,6 +1122,7 @@ app.get('/api/download', async (req, res) => {
     downloadExtraArgs.push(
       '-f', targetFmt,
       '--merge-output-format', 'mp4',
+      '--remux-video', 'mp4',
       '-o', tmpTemplate,
       cleanUrl
     );
@@ -1213,7 +1197,17 @@ app.get('/api/download', async (req, res) => {
     return;
   }
 
-  const actualFilePath = path.join(tmpDir, matchingFiles[0]);
+  const actualFileName = matchingFiles[0];
+  const actualFilePath = path.join(tmpDir, actualFileName);
+  const ext = path.extname(actualFileName).toLowerCase();
+
+  let contentType = isAudio ? 'audio/mpeg' : 'video/mp4';
+  if (ext === '.webm') contentType = 'video/webm';
+  else if (ext === '.mkv') contentType = 'video/x-matroska';
+  else if (ext === '.mp3') contentType = 'audio/mpeg';
+
+  const baseName = safeFilename.replace(/\.[^/.]+$/, '');
+  const finalFilename = `${baseName}${ext}`;
 
   fs.stat(actualFilePath, (statErr, stat) => {
     if (statErr || !stat) {
@@ -1227,9 +1221,9 @@ app.get('/api/download', async (req, res) => {
       return;
     }
 
-    console.log(`[DOWNLOAD] Streaming ${stat.size} bytes → ${safeFilename}`);
-    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+    console.log(`[DOWNLOAD] Streaming ${stat.size} bytes → ${finalFilename}`);
+    res.setHeader('Content-Disposition', `attachment; filename="${finalFilename}"`);
+    res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', stat.size);
 
     const readStream = fs.createReadStream(actualFilePath);
