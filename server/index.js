@@ -476,6 +476,162 @@ function httpsGet(url, timeoutMs = 15000) {
   });
 }
 
+// ─── Alternative Download: Piped + Invidious via Server Proxy ───
+/**
+ * When yt-dlp is bot-blocked, use Piped or Invidious public APIs to get the
+ * video stream URL, then PROXY it through our server to the client.
+ * Server-side proxy = no CORS issues, no redirect issues.
+ * Flow: Client → Our server → Piped/Invidious CDN → Our server → Client
+ */
+
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://api.piped.yt',
+  'https://piped-api.privacy.com.de',
+  'https://watchapi.whatever.social',
+];
+
+const INVIDIOUS_INSTANCES = [
+  'https://iv.datura.network',
+  'https://invidious.nerdvpn.de',
+  'https://inv.tux.pizza',
+  'https://invidious.privacydev.net',
+  'https://yt.cdaut.de',
+];
+
+/** Proxies a CDN/stream URL through the server to the HTTP response. */
+function proxyStreamToClient(res, streamUrl, filename, isAudio) {
+  return new Promise((resolve) => {
+    const reqHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': 'https://www.youtube.com/',
+      'Origin': 'https://www.youtube.com',
+    };
+
+    function doRequest(targetUrl, redirectsLeft = 5) {
+      https.get(targetUrl, { headers: reqHeaders }, (upstream) => {
+        // Handle HTTP redirects manually
+        if ([301, 302, 303, 307, 308].includes(upstream.statusCode) && upstream.headers.location) {
+          upstream.resume();
+          if (redirectsLeft <= 0) { resolve(false); return; }
+          const next = upstream.headers.location.startsWith('http')
+            ? upstream.headers.location
+            : new URL(upstream.headers.location, targetUrl).href;
+          return doRequest(next, redirectsLeft - 1);
+        }
+
+        if (upstream.statusCode >= 400) {
+          console.warn(`[PROXY] Upstream returned HTTP ${upstream.statusCode} for ${targetUrl.slice(0, 80)}`);
+          upstream.resume();
+          return resolve(false);
+        }
+
+        if (res.headersSent) return resolve(false);
+
+        const ct = upstream.headers['content-type'] || (isAudio ? 'audio/webm' : 'video/mp4');
+        res.setHeader('Content-Type', ct);
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        if (upstream.headers['content-length']) {
+          res.setHeader('Content-Length', upstream.headers['content-length']);
+        }
+        res.setHeader('Cache-Control', 'no-store');
+
+        upstream.pipe(res);
+        upstream.on('end', () => { console.log('[PROXY] ✓ Stream complete'); resolve(true); });
+        upstream.on('error', (e) => { console.error('[PROXY] Stream error:', e.message); resolve(false); });
+        res.on('close', () => resolve(true)); // client closed connection early
+      }).on('error', (e) => {
+        console.error('[PROXY] Request error:', e.message);
+        resolve(false);
+      }).setTimeout(60000, function() { this.destroy(); resolve(false); });
+    }
+
+    doRequest(streamUrl);
+  });
+}
+
+async function tryAlternativeDownload(res, videoId, format, isAudio, safeFilename) {
+  let targetHeight = 720;
+  if (format) {
+    const m = format.match(/height<=?\??(\d+)/);
+    if (m && m[1]) targetHeight = parseInt(m[1]);
+  }
+
+  // ── 1. Try Piped (Piped proxies YouTube themselves) ────────────
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      console.log(`[PIPED] Trying ${instance}...`);
+      const raw = await httpsGet(`${instance}/streams/${videoId}`, 10000);
+      const data = JSON.parse(raw);
+      let streamUrl = null;
+
+      if (isAudio) {
+        const streams = (data.audioStreams || []).filter(s => s.url);
+        streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        streamUrl = streams[0]?.url;
+      } else {
+        // videoOnly=false means muxed video+audio
+        const muxed = (data.videoStreams || []).filter(s => s.url && !s.videoOnly);
+        muxed.sort((a, b) => {
+          const qa = parseInt((a.quality || '').replace('p', '') || '0');
+          const qb = parseInt((b.quality || '').replace('p', '') || '0');
+          return qb - qa;
+        });
+        const match = muxed.find(s => parseInt((s.quality || '').replace('p', '') || '9999') <= targetHeight)
+          || muxed[muxed.length - 1];
+        streamUrl = match?.url;
+      }
+
+      if (streamUrl) {
+        console.log(`[PIPED] Got stream URL from ${instance}, proxying to client...`);
+        const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
+        if (ok) return true;
+        console.warn(`[PIPED] Proxy failed for ${instance}, trying next...`);
+      }
+    } catch (e) {
+      console.warn(`[PIPED] ${instance} failed: ${e.message}`);
+    }
+  }
+
+  // ── 2. Try Invidious (returns direct YouTube CDN URLs) ─────────
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      console.log(`[INVIDIOUS] Trying ${instance}...`);
+      const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}`, 10000);
+      const data = JSON.parse(raw);
+      let streamUrl = null;
+
+      if (isAudio) {
+        const streams = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/') && f.url);
+        streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        streamUrl = streams[0]?.url;
+      } else {
+        const muxed = (data.formatStreams || []).filter(f => f.url);
+        muxed.sort((a, b) => {
+          const ha = parseInt((a.resolution || '0').replace('p', '')) || 0;
+          const hb = parseInt((b.resolution || '0').replace('p', '')) || 0;
+          return hb - ha;
+        });
+        const match = muxed.find(f => parseInt((f.resolution || '9999').replace('p', '')) <= targetHeight)
+          || muxed[muxed.length - 1];
+        streamUrl = match?.url;
+      }
+
+      if (streamUrl) {
+        console.log(`[INVIDIOUS] Got CDN URL from ${instance}, proxying to client...`);
+        const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
+        if (ok) return true;
+        console.warn(`[INVIDIOUS] Proxy failed for ${instance}, trying next...`);
+      }
+    } catch (e) {
+      console.warn(`[INVIDIOUS] ${instance} failed: ${e.message}`);
+    }
+  }
+
+  return false; // all alternatives exhausted
+}
+
+// ─── YouTube oEmbed + Video ID helpers ───────────────────────
 async function fetchYouTubeOEmbed(videoUrl) {
   const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
   const raw = await httpsGet(url);
@@ -493,81 +649,6 @@ function extractVideoId(url) {
     }
   } catch { /* ignore */ }
   return null;
-}
-
-// ─── Invidious Fallback for Downloads ────────────────────────────
-/**
- * When yt-dlp is blocked on cloud IPs, query Invidious (a YouTube frontend)
- * to get the direct CDN URL, then redirect the browser to it.
- * The browser downloads directly from YouTube’s CDN — bypasses Render’s IP.
- */
-const INVIDIOUS_INSTANCES = [
-  'https://iv.datura.network',
-  'https://invidious.nerdvpn.de',
-  'https://inv.tux.pizza',
-  'https://invidious.privacydev.net',
-  'https://yt.cdaut.de',
-  'https://invidious.darkness.services',
-];
-
-async function tryInvidiousDownload(res, videoId, format, isAudio, safeFilename) {
-  // Parse target height from format string e.g. "bestvideo[height<=?720]+..."
-  let targetHeight = 720;
-  if (format) {
-    const m = format.match(/height<=?\??(\d+)/);
-    if (m && m[1]) targetHeight = parseInt(m[1]);
-  }
-
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      console.log(`[INVIDIOUS] Trying ${instance} for videoId=${videoId}`);
-      const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}`, 10000);
-      const data = JSON.parse(raw);
-
-      let directUrl = null;
-
-      if (isAudio) {
-        // Get best audio-only stream
-        const audioFmts = (data.adaptiveFormats || [])
-          .filter(f => f.type && f.type.startsWith('audio/') && f.url);
-        audioFmts.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        if (audioFmts[0]?.url) directUrl = audioFmts[0].url;
-      } else {
-        // formatStreams = muxed (video+audio in one file, MP4) — ideal for direct download
-        const muxed = (data.formatStreams || []).filter(f => f.url);
-        muxed.sort((a, b) => {
-          const ha = parseInt((a.resolution || '0').replace('p', '')) || 0;
-          const hb = parseInt((b.resolution || '0').replace('p', '')) || 0;
-          return hb - ha;
-        });
-        // Find best quality that doesn’t exceed target height
-        const match = muxed.find(f => {
-          const h = parseInt((f.resolution || '9999').replace('p', '')) || 9999;
-          return h <= targetHeight;
-        }) || muxed[muxed.length - 1];
-        if (match?.url) directUrl = match.url;
-      }
-
-      if (directUrl) {
-        console.log(`[INVIDIOUS] ✓ Got direct CDN URL from ${instance} — returning as JSON`);
-        // Return as JSON so the frontend can open it via <a> tag.
-        // We CANNOT use res.redirect() here because the frontend uses fetch(),
-        // and fetch() follows redirects but then gets CORS-blocked on googlevideo.com.
-        // Navigation via <a href> is NOT subject to CORS restrictions.
-        res.json({
-          success: true,
-          directUrl,
-          redirect: true,
-          filename: safeFilename,
-          source: 'invidious',
-        });
-        return true;
-      }
-    } catch (e) {
-      console.warn(`[INVIDIOUS] ${instance} failed: ${e.message}`);
-    }
-  }
-  return false; // all instances failed
 }
 
 function buildOEmbedResponse(rawUrl, oembed) {
