@@ -556,130 +556,103 @@ function proxyStreamToClient(res, streamUrl, filename, isAudio) {
   });
 }
 
-async function tryAlternativeDownload(res, videoId, format, isAudio, safeFilename) {
-  let targetHeight = 720;
-  if (format) {
-    const m = format.match(/height<=?\??(\d+)/);
-    if (m && m[1]) targetHeight = parseInt(m[1]);
-  }
-
-  // ── 0. Try Cobalt API ──────────────────────────────────────────
-  try {
-    console.log(`[COBALT] Trying Cobalt API for videoId=${videoId}...`);
-    const cobaltReq = JSON.stringify({
-      url: `https://www.youtube.com/watch?v=${videoId}`,
-      videoQuality: String(targetHeight),
-      isAudioOnly: Boolean(isAudio),
-    });
-
-    const options = {
-      hostname: 'api.cobalt.tools',
-      path: '/api/json',
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Content-Length': Buffer.byteLength(cobaltReq),
-      },
-      timeout: 7000,
-    };
-
-    const raw = await new Promise((resolve, reject) => {
-      const r = https.request(options, (cRes) => {
+/** Races all providers in parallel and returns the first working stream URL. */
+async function resolveYouTubeStreamUrl(videoId, isAudio, targetHeight) {
+  // ─ Cobalt helper
+  function cobaltPromise() {
+    return new Promise((resolve, reject) => {
+      const body = JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        videoQuality: String(targetHeight),
+        isAudioOnly: Boolean(isAudio),
+      });
+      const r = https.request({
+        hostname: 'api.cobalt.tools', path: '/api/json', method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 9000,
+      }, (upstream) => {
         let d = '';
-        cRes.on('data', chunk => d += chunk);
-        cRes.on('end', () => resolve(d));
+        upstream.on('data', c => d += c);
+        upstream.on('end', () => {
+          try {
+            const parsed = JSON.parse(d);
+            if (parsed.url) resolve(parsed.url);
+            else reject(new Error('No URL from Cobalt'));
+          } catch { reject(new Error('Cobalt JSON parse fail')); }
+        });
       });
       r.on('error', reject);
-      r.on('timeout', () => { r.destroy(); reject(new Error('timeout')); });
-      r.write(cobaltReq);
+      r.on('timeout', () => { r.destroy(); reject(new Error('Cobalt timeout')); });
+      r.write(body);
       r.end();
     });
+  }
 
-    const parsed = JSON.parse(raw);
-    const streamUrl = parsed.url;
-    if (streamUrl) {
-      console.log(`[COBALT] Got stream URL, proxying to client...`);
-      const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
-      if (ok) return true;
+  // ─ Piped helper
+  async function pipedPromise(instance) {
+    const raw = await httpsGet(`${instance}/streams/${videoId}`, 9000);
+    const data = JSON.parse(raw);
+    let url = null;
+    if (isAudio) {
+      const streams = (data.audioStreams || []).filter(s => s.url);
+      streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      url = streams[0]?.url;
+    } else {
+      const muxed = (data.videoStreams || []).filter(s => s.url && !s.videoOnly);
+      muxed.sort((a, b) => {
+        const qa = parseInt((a.quality || '').replace('p','') || '0');
+        const qb = parseInt((b.quality || '').replace('p','') || '0');
+        return qb - qa;
+      });
+      const match = muxed.find(s => parseInt((s.quality || '').replace('p','') || '9999') <= targetHeight)
+        || muxed[muxed.length - 1];
+      url = match?.url;
     }
+    if (!url) throw new Error(`No URL from Piped ${instance}`);
+    return url;
+  }
+
+  // ─ Invidious helper
+  async function invidiousPromise(instance) {
+    const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}`, 9000);
+    const data = JSON.parse(raw);
+    let url = null;
+    if (isAudio) {
+      const streams = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/') && f.url);
+      streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      url = streams[0]?.url;
+    } else {
+      const muxed = (data.formatStreams || []).filter(f => f.url);
+      muxed.sort((a, b) => (parseInt((b.resolution||'0').replace('p',''))||0) - (parseInt((a.resolution||'0').replace('p',''))||0));
+      const match = muxed.find(f => (parseInt((f.resolution||'9999').replace('p',''))||9999) <= targetHeight)
+        || muxed[muxed.length - 1];
+      url = match?.url;
+    }
+    if (!url) throw new Error(`No URL from Invidious ${instance}`);
+    return url;
+  }
+
+  // ─ Race everything in parallel with a hard 12s cap
+  const hardTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('resolveStreamUrl: 12s timeout')), 12000));
+
+  try {
+    const url = await Promise.race([
+      Promise.any([
+        cobaltPromise(),
+        pipedPromise('https://pipedapi.kavin.rocks'),
+        pipedPromise('https://api.piped.yt'),
+        invidiousPromise('https://iv.datura.network'),
+        invidiousPromise('https://invidious.nerdvpn.de'),
+        invidiousPromise('https://inv.tux.pizza'),
+      ]),
+      hardTimeout,
+    ]);
+    console.log(`[RESOLVE] ✓ Got stream URL: ${String(url).slice(0, 80)}`);
+    return url;
   } catch (e) {
-    console.warn(`[COBALT] Cobalt failed: ${e.message}`);
+    console.error('[RESOLVE] All providers failed:', e.message);
+    return null;
   }
-
-  // ── 1. Try Piped (Piped proxies YouTube themselves) ────────────
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      console.log(`[PIPED] Trying ${instance}...`);
-      const raw = await httpsGet(`${instance}/streams/${videoId}`, 10000);
-      const data = JSON.parse(raw);
-      let streamUrl = null;
-
-      if (isAudio) {
-        const streams = (data.audioStreams || []).filter(s => s.url);
-        streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        streamUrl = streams[0]?.url;
-      } else {
-        // videoOnly=false means muxed video+audio
-        const muxed = (data.videoStreams || []).filter(s => s.url && !s.videoOnly);
-        muxed.sort((a, b) => {
-          const qa = parseInt((a.quality || '').replace('p', '') || '0');
-          const qb = parseInt((b.quality || '').replace('p', '') || '0');
-          return qb - qa;
-        });
-        const match = muxed.find(s => parseInt((s.quality || '').replace('p', '') || '9999') <= targetHeight)
-          || muxed[muxed.length - 1];
-        streamUrl = match?.url;
-      }
-
-      if (streamUrl) {
-        console.log(`[PIPED] Got stream URL from ${instance}, proxying to client...`);
-        const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
-        if (ok) return true;
-        console.warn(`[PIPED] Proxy failed for ${instance}, trying next...`);
-      }
-    } catch (e) {
-      console.warn(`[PIPED] ${instance} failed: ${e.message}`);
-    }
-  }
-
-  // ── 2. Try Invidious (returns direct YouTube CDN URLs) ─────────
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      console.log(`[INVIDIOUS] Trying ${instance}...`);
-      const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}`, 10000);
-      const data = JSON.parse(raw);
-      let streamUrl = null;
-
-      if (isAudio) {
-        const streams = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/') && f.url);
-        streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        streamUrl = streams[0]?.url;
-      } else {
-        const muxed = (data.formatStreams || []).filter(f => f.url);
-        muxed.sort((a, b) => {
-          const ha = parseInt((a.resolution || '0').replace('p', '')) || 0;
-          const hb = parseInt((b.resolution || '0').replace('p', '')) || 0;
-          return hb - ha;
-        });
-        const match = muxed.find(f => parseInt((f.resolution || '9999').replace('p', '')) <= targetHeight)
-          || muxed[muxed.length - 1];
-        streamUrl = match?.url;
-      }
-
-      if (streamUrl) {
-        console.log(`[INVIDIOUS] Got CDN URL from ${instance}, proxying to client...`);
-        const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
-        if (ok) return true;
-        console.warn(`[INVIDIOUS] Proxy failed for ${instance}, trying next...`);
-      }
-    } catch (e) {
-      console.warn(`[INVIDIOUS] ${instance} failed: ${e.message}`);
-    }
-  }
-
-  return false; // all alternatives exhausted
 }
 
 // ─── YouTube oEmbed + Video ID helpers ───────────────────────
@@ -977,18 +950,38 @@ app.get('/api/download', async (req, res) => {
 
   console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
 
-  // ── FAST PATH: Try Cobalt / Piped / Invidious stream proxying for YouTube ──
+  // ── FAST PATH for YouTube: parallel race of all providers (no yt-dlp needed) ──
   if (isYouTube && videoId) {
-    console.log(`[DOWNLOAD] Attempting direct stream proxy for YouTube videoId=${videoId}...`);
-    const proxied = await tryAlternativeDownload(res, videoId, format, isAudio, safeFilename);
-    if (proxied) {
-      console.log('[DOWNLOAD] Direct stream proxy succeeded!');
-      return;
+    let targetHeight = 720;
+    if (format) {
+      const m = format.match(/height<=?\??(\d+)/);
+      if (m && m[1]) targetHeight = parseInt(m[1]);
     }
-    console.warn('[DOWNLOAD] Stream proxying returned false, falling back to yt-dlp...');
+
+    console.log(`[DOWNLOAD] Racing stream providers for videoId=${videoId}...`);
+    const streamUrl = await resolveYouTubeStreamUrl(videoId, isAudio, targetHeight);
+
+    if (streamUrl) {
+      const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
+      if (ok) {
+        console.log('[DOWNLOAD] ✓ Stream proxy complete');
+        return;
+      }
+    }
+
+    // All providers failed — return a clean JSON error within Render's timeout
+    if (!res.headersSent) {
+      return res.status(503).json({
+        success: false,
+        code: 'STREAM_UNAVAILABLE',
+        message: 'Could not retrieve a download stream from any provider.',
+        solution: 'Try again in a few seconds, or try a different video.',
+      });
+    }
+    return;
   }
 
-  // Build the download-specific extra args (format, output path, ffmpeg)
+  // Non-YouTube (Instagram etc.) — use yt-dlp
   const downloadExtraArgs = [];
   if (ffmpegPath) downloadExtraArgs.push('--ffmpeg-location', ffmpegPath);
 
