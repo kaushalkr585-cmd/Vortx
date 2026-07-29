@@ -493,16 +493,19 @@ function httpsGet(url, timeoutMs = 15000) {
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://api.piped.yt',
-  'https://piped-api.privacy.com.de',
-  'https://watchapi.whatever.social',
+  'https://piped.tokhmi.xyz',
+  'https://piped.moomoo.me',
+  'https://piped.yt',
 ];
 
 const INVIDIOUS_INSTANCES = [
-  'https://iv.datura.network',
-  'https://invidious.nerdvpn.de',
-  'https://inv.tux.pizza',
-  'https://invidious.privacydev.net',
-  'https://yt.cdaut.de',
+  'https://vid.puffyan.us',
+  'https://inv.riverside.rocks',
+  'https://yt.artemislena.eu',
+  'https://invidious.flokinet.to',
+  'https://invidious.tiekoetter.com',
+  'https://invidious.snopyta.org',
+  'https://invidious.esmailelbob.xyz',
 ];
 
 /** Proxies a CDN/stream URL through the server to the HTTP response. */
@@ -612,9 +615,9 @@ async function resolveYouTubeStreamUrl(videoId, isAudio, targetHeight) {
     return url;
   }
 
-  // ─ Invidious helper
+  // ─ Invidious helper (?local=true forces proxied URLs with CORS headers)
   async function invidiousPromise(instance) {
-    const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}`, 9000);
+    const raw = await httpsGet(`${instance}/api/v1/videos/${videoId}?local=true`, 9000);
     const data = JSON.parse(raw);
     let url = null;
     if (isAudio) {
