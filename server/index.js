@@ -111,21 +111,45 @@ const ALLOWED_HOSTS = [
   'instagram.com', 'www.instagram.com',
 ];
 
+function extractYouTubeId(parsed) {
+  const host = parsed.hostname.toLowerCase();
+  if (host.includes('youtube.com')) {
+    if (parsed.searchParams.has('v')) {
+      return parsed.searchParams.get('v');
+    }
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if ((parts[0] === 'shorts' || parts[0] === 'embed' || parts[0] === 'v') && parts[1]) {
+      return parts[1];
+    }
+  }
+  if (host === 'youtu.be') {
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (parts[0]) return parts[0];
+  }
+  return null;
+}
+
 function validateUrl(rawUrl) {
-  if (!rawUrl || typeof rawUrl !== 'string') return null;
-  // Strip whitespace
+  if (!rawUrl || typeof rawUrl !== 'string') return { valid: false, reason: 'EMPTY' };
   const trimmed = rawUrl.trim();
-  if (trimmed.length > 2048) return null;
-  // Block shell injection patterns
-  if (/[;&|`$<>{}[\]\\]/.test(trimmed)) return null;
+  if (trimmed.length > 2048) return { valid: false, reason: 'TOO_LONG' };
+  if (/[;&|`$<>{}[\]\\]/.test(trimmed)) return { valid: false, reason: 'MALFORMED' };
+
   try {
     const parsed = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
     const host = parsed.hostname.toLowerCase();
     const allowed = ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h));
-    if (!allowed) return null;
-    return parsed.href;
+    if (!allowed) return { valid: false, reason: 'UNSUPPORTED_HOST' };
+
+    // Check YouTube video ID if it's a YouTube URL
+    const ytId = extractYouTubeId(parsed);
+    if (ytId !== null && !/^[a-zA-Z0-9_-]{11}$/.test(ytId)) {
+      return { valid: false, reason: 'INCOMPLETE_ID', rawId: ytId };
+    }
+
+    return { valid: true, href: parsed.href };
   } catch {
-    return null;
+    return { valid: false, reason: 'INVALID_SYNTAX' };
   }
 }
 
@@ -133,31 +157,9 @@ function sanitizeUrl(rawUrl) {
   if (!rawUrl) return rawUrl;
   try {
     const parsed = new URL(rawUrl);
-    const host = parsed.hostname.toLowerCase();
-
-    // Standard youtube.com URLs
-    if (host.includes('youtube.com')) {
-      if (parsed.searchParams.has('v')) {
-        const videoId = parsed.searchParams.get('v');
-        if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-          return `https://www.youtube.com/watch?v=${videoId}`;
-        }
-      }
-      const parts = parsed.pathname.split('/').filter(Boolean);
-      if ((parts[0] === 'shorts' || parts[0] === 'embed') && parts[1]) {
-        const videoId = parts[1];
-        if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-          return `https://www.youtube.com/watch?v=${videoId}`;
-        }
-      }
-    }
-
-    // Shortened youtu.be URLs
-    if (host === 'youtu.be') {
-      const videoId = parsed.pathname.replace(/^\//, '').split('/')[0];
-      if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-        return `https://www.youtube.com/watch?v=${videoId}`;
-      }
+    const ytId = extractYouTubeId(parsed);
+    if (ytId && /^[a-zA-Z0-9_-]{11}$/.test(ytId)) {
+      return `https://www.youtube.com/watch?v=${ytId}`;
     }
   } catch { /* fall through */ }
   return rawUrl;
@@ -368,17 +370,19 @@ app.get('/api/info', async (req, res) => {
   const rawUrl = req.query.url;
   if (!rawUrl) return res.status(400).json({ success: false, code: 'MISSING_URL', message: 'Missing url parameter.' });
 
-  const validUrl = validateUrl(rawUrl);
-  if (!validUrl) {
+  const urlResult = validateUrl(rawUrl);
+  if (!urlResult.valid) {
     return res.status(400).json({
       success: false,
       code: 'INVALID_URL',
-      message: 'The URL you entered is not a supported video link.',
-      solution: 'Please use a valid YouTube or Instagram URL.',
+      message: urlResult.reason === 'INCOMPLETE_ID'
+        ? 'The YouTube video URL or ID appears to be incomplete.'
+        : 'The link you entered is not a supported video URL.',
+      solution: 'Please paste a complete YouTube or Instagram link (e.g. https://youtu.be/dQw4w9WgXcQ).',
     });
   }
 
-  const cleanUrl = sanitizeUrl(validUrl);
+  const cleanUrl = sanitizeUrl(urlResult.href);
   console.log(`[INFO] ${cleanUrl}`);
 
   // Cache hit
@@ -572,11 +576,15 @@ app.get('/api/download', (req, res) => {
     return res.status(400).json({ success: false, code: 'MISSING_URL', message: 'Missing url parameter.' });
   }
 
-  const validUrl = validateUrl(rawUrl);
-  if (!validUrl) {
+  const urlResult = validateUrl(rawUrl);
+  if (!urlResult.valid) {
     return res.status(400).json({
-      success: false, code: 'INVALID_URL',
-      message: 'The URL you entered is not supported.',
+      success: false,
+      code: 'INVALID_URL',
+      message: urlResult.reason === 'INCOMPLETE_ID'
+        ? 'The YouTube video URL or ID is incomplete.'
+        : 'The link you entered is not supported.',
+      solution: 'Please paste a valid, complete YouTube or Instagram URL.',
     });
   }
 
@@ -587,7 +595,7 @@ app.get('/api/download', (req, res) => {
 
   const fileId = `vortx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const tmpTemplate = path.join(os.tmpdir(), `${fileId}.%(ext)s`);
-  const cleanUrl = sanitizeUrl(validUrl);
+  const cleanUrl = sanitizeUrl(urlResult.href);
 
   console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
 
