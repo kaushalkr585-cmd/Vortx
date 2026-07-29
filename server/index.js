@@ -78,10 +78,13 @@ function getCookiesPath() {
       }
 
       const hasYT = cookieText.includes('youtube.com') || cookieText.includes('.youtube.com');
+      // Accept any meaningful YouTube auth token
       const hasAuth = cookieText.includes('__Secure-3PAPISID') ||
                       cookieText.includes('SAPISID') ||
                       cookieText.includes('__Secure-3PSID') ||
-                      cookieText.includes('LOGIN_INFO');
+                      cookieText.includes('LOGIN_INFO') ||
+                      cookieText.includes('SID') ||
+                      cookieText.includes('SSID');
 
       if (hasYT && hasAuth) {
         const envPath = path.join(os.tmpdir(), 'vortx_yt_cookies.txt');
@@ -108,7 +111,8 @@ function getCookiesPath() {
         const hasAuth = content.includes('__Secure-3PAPISID') ||
                         content.includes('SAPISID') ||
                         content.includes('__Secure-3PSID') ||
-                        content.includes('LOGIN_INFO');
+                        content.includes('LOGIN_INFO') ||
+                        content.includes('SID');
         if (hasYT && hasAuth) {
           console.log(`[COOKIES] Using cookie file: ${p}`);
           return p;
@@ -293,10 +297,11 @@ function parseYtdlpError(stderr) {
  */
 function buildBaseArgs(cookiesPath, clientOverride) {
   // Player client strategy:
-  //   tv_embedded  — works on server IPs, no JS runtime needed, bypasses bot detection
-  //   android_vr   — secondary fallback, also bypasses JS challenges
-  //   web          — uses cookies for auth but requires JS runtime (deno)
-  //   mweb         — mobile web, usually fails on server IPs
+  //   web          — full auth with cookies, best quality, needs JS runtime on server IPs
+  //   tv_embedded  — works on server IPs, no JS runtime needed, good bot bypass
+  //   android_vr   — secondary fallback, bypasses JS challenges
+  //   web_creator  — creator client, sometimes bypasses bot detection differently
+  //   mweb         — mobile web, last resort
   const playerClient = clientOverride || 'tv_embedded,android_vr,web';
 
   const args = [
@@ -308,19 +313,16 @@ function buildBaseArgs(cookiesPath, clientOverride) {
     // Add HTTP headers that real browsers send
     '--add-header', 'Accept-Language:en-US,en;q=0.9',
     '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    // Player client fallback chain — tv_embedded works best on server IPs without JS runtime
+    '--add-header', 'Origin:https://www.youtube.com',
+    // Player client
     '--extractor-args', `youtube:player_client=${playerClient}`,
-    // NOTE: Do NOT add --js-runtimes here. yt-dlp 2026.07+ uses deno by default.
-    // Passing --js-runtimes node causes errors if node JS runtime is not properly configured.
-    // tv_embedded/android_vr clients bypass the n-challenge that requires a JS runtime.
     // Retry & resilience
-    '--retries', '5',
-    '--extractor-retries', '5',
-    '--fragment-retries', '5',
+    '--retries', '3',
+    '--extractor-retries', '3',
+    '--fragment-retries', '3',
     '--retry-sleep', 'linear=1::3',
     // Bypass geographic restrictions
     '--geo-bypass',
-    // Skip HTTPS certificate errors
     '--no-check-certificates',
   ];
 
@@ -329,6 +331,47 @@ function buildBaseArgs(cookiesPath, clientOverride) {
   }
 
   return args;
+}
+
+// ─── Exhaustive Bot-Detection Bypass Runner ───────────────────
+/**
+ * Tries yt-dlp with multiple client/cookie combinations in sequence.
+ * Returns the first successful result, or the last failed result.
+ * Attempts (in order):
+ *   1. tv_embedded + cookies       — best for cloud IPs with auth
+ *   2. web_creator + cookies       — alternate client with auth
+ *   3. android_vr + cookies        — no JS runtime needed
+ *   4. tv_embedded (no cookies)    — unauthenticated fallback
+ *   5. android_vr (no cookies)     — last resort
+ */
+async function runWithBotBypass(extraArgs, cookiesPath) {
+  const attempts = [
+    { client: 'tv_embedded',           cp: cookiesPath, label: 'tv_embedded+cookies'    },
+    { client: 'web_creator,tv_embedded', cp: cookiesPath, label: 'web_creator+cookies'  },
+    { client: 'android_vr',            cp: cookiesPath, label: 'android_vr+cookies'     },
+    { client: 'tv_embedded',           cp: null,        label: 'tv_embedded (no cookies)' },
+    { client: 'android_vr',            cp: null,        label: 'android_vr (no cookies)' },
+  ];
+
+  let lastResult;
+  for (const attempt of attempts) {
+    const args = [...buildBaseArgs(attempt.cp, attempt.client), ...extraArgs];
+    console.log(`[BOT-BYPASS] Trying: ${attempt.label}`);
+    const result = await runYtdlp(args);
+    if (result.code === 0) {
+      console.log(`[BOT-BYPASS] Success with: ${attempt.label}`);
+      return result;
+    }
+    lastResult = result;
+    const errText = result.stderr || '';
+    // If it's NOT a bot detection error, stop retrying (different error type)
+    const isBotOrAuth = /Sign in to confirm|not a bot|bot detection|confirm you're not a bot|please verify|authentication|This video is unavailable/i.test(errText);
+    if (!isBotOrAuth) {
+      console.warn(`[BOT-BYPASS] Non-bot error on ${attempt.label}, stopping retries.`);
+      break;
+    }
+  }
+  return lastResult;
 }
 
 // ─── Health Check ─────────────────────────────────────────────
@@ -436,9 +479,9 @@ app.get('/api/info', async (req, res) => {
   }
 
   const cookiesPath = getCookiesPath();
-  let args = [...buildBaseArgs(cookiesPath), '--dump-json', cleanUrl];
 
-  let result = await runYtdlp(args);
+  // Use exhaustive bot-bypass runner for /api/info
+  let result = await runWithBotBypass(['--dump-json', cleanUrl], cookiesPath);
 
   if (result.spawnError) {
     return res.status(503).json({
@@ -448,35 +491,6 @@ app.get('/api/info', async (req, res) => {
       solution: 'Run: pip install yt-dlp',
       details: result.stderr,
     });
-  }
-
-  // Retry strategy: if first attempt fails, try with android_vr-only client
-  // (avoids JS runtime requirements entirely) while keeping cookies
-  if (result.code !== 0) {
-    const errText = result.stderr || '';
-    const isBotDetected = /Sign in to confirm|not a bot|bot detection|confirm you're not a bot|please verify/i.test(errText);
-    const isJsRuntimeIssue = /JavaScript runtime|js.?runtime|ExtractorError.*nsig/i.test(errText);
-
-    if (isBotDetected || isJsRuntimeIssue) {
-      console.warn(`[INFO] Bot detection / JS runtime issue detected. Retrying with android_vr client...`);
-      const retryArgs = [...buildBaseArgs(cookiesPath, 'android_vr,tv_embedded'), '--dump-json', cleanUrl];
-      const retryResult = await runYtdlp(retryArgs);
-      if (retryResult.code === 0) {
-        result = retryResult;
-      } else if (cookiesPath) {
-        // Last resort: try without cookies using android_vr
-        console.warn('[INFO] Retry with cookies failed. Trying without cookies...');
-        const noCookieArgs = [...buildBaseArgs(null, 'android_vr,tv_embedded'), '--dump-json', cleanUrl];
-        const lastResult = await runYtdlp(noCookieArgs);
-        if (lastResult.code === 0) result = lastResult;
-      }
-    } else if (cookiesPath) {
-      // Non-bot error with cookies — retry without cookies as fallback
-      console.warn('[INFO] yt-dlp failed with cookies. Retrying without cookies...');
-      const noCookieArgs = [...buildBaseArgs(null), '--dump-json', cleanUrl];
-      const retryResult = await runYtdlp(noCookieArgs);
-      if (retryResult.code === 0) result = retryResult;
-    }
   }
 
   if (result.code !== 0) {
@@ -654,47 +668,44 @@ app.get('/api/download', async (req, res) => {
 
   console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
 
-  function buildDownloadArgs(cp, clientOverride) {
-    const dArgs = [...buildBaseArgs(cp, clientOverride)];
+  // Build the download-specific extra args (format, output path, ffmpeg)
+  const downloadExtraArgs = [];
+  if (ffmpegPath) downloadExtraArgs.push('--ffmpeg-location', ffmpegPath);
 
-    if (ffmpegPath) {
-      dArgs.push('--ffmpeg-location', ffmpegPath);
-    }
-
-    if (isAudio) {
-      const quality = audioQuality || '2';
-      dArgs.push(
-        '-f', 'bestaudio/best',
-        '--extract-audio',
-        '--audio-format', 'mp3',
-        '--audio-quality', quality,
-        '-o', tmpTemplate,
-        cleanUrl
-      );
-    } else {
-      let targetFmt = 'bv*+ba/b';
-      if (format) {
-        const match = format.match(/height<=?\??(\d+)/);
-        if (match && match[1]) {
-          const h = match[1];
-          targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b`;
-        } else {
-          targetFmt = `${format}/bv*+ba/b`;
-        }
+  if (isAudio) {
+    const quality = audioQuality || '2';
+    downloadExtraArgs.push(
+      '-f', 'bestaudio/best',
+      '--extract-audio',
+      '--audio-format', 'mp3',
+      '--audio-quality', quality,
+      '-o', tmpTemplate,
+      cleanUrl
+    );
+  } else {
+    let targetFmt = 'bv*+ba/b';
+    if (format) {
+      const match = format.match(/height<=?\??(\d+)/);
+      if (match && match[1]) {
+        const h = match[1];
+        targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b`;
+      } else {
+        targetFmt = `${format}/bv*+ba/b`;
       }
-      console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
-      dArgs.push(
-        '-f', targetFmt,
-        '--merge-output-format', 'mp4',
-        '-o', tmpTemplate,
-        cleanUrl
-      );
     }
-    return dArgs;
+    console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
+    downloadExtraArgs.push(
+      '-f', targetFmt,
+      '--merge-output-format', 'mp4',
+      '-o', tmpTemplate,
+      cleanUrl
+    );
   }
 
   const cookiesPath = getCookiesPath();
-  let result = await runYtdlp(buildDownloadArgs(cookiesPath));
+
+  // Use exhaustive bot-bypass runner for /api/download
+  let result = await runWithBotBypass(downloadExtraArgs, cookiesPath);
 
   if (result.spawnError) {
     return res.status(503).json({
@@ -703,49 +714,6 @@ app.get('/api/download', async (req, res) => {
       message: 'yt-dlp is not installed on the server.',
       solution: 'Run: pip install yt-dlp',
     });
-  }
-
-  // Retry strategy: mirror the /api/info retry logic
-  if (result.code !== 0) {
-    const errText = result.stderr || '';
-    const isBotDetected = /Sign in to confirm|not a bot|bot detection|confirm you're not a bot|please verify/i.test(errText);
-    const isJsRuntimeIssue = /JavaScript runtime|js.?runtime|ExtractorError.*nsig/i.test(errText);
-
-    if (isBotDetected || isJsRuntimeIssue) {
-      console.warn('[DOWNLOAD] Bot detection / JS runtime issue. Retrying with android_vr client...');
-      // Rebuild args with android_vr client override
-      function buildDownloadArgsAlt(cp, clientOverride) {
-        const dArgs = [...buildBaseArgs(cp, clientOverride)];
-        if (ffmpegPath) dArgs.push('--ffmpeg-location', ffmpegPath);
-        if (isAudio) {
-          const quality = audioQuality || '2';
-          dArgs.push('-f', 'bestaudio/best', '--extract-audio', '--audio-format', 'mp3', '--audio-quality', quality, '-o', tmpTemplate, cleanUrl);
-        } else {
-          let targetFmt = 'bv*+ba/b';
-          if (format) {
-            const match = format.match(/height<=?\??(\d+)/);
-            if (match && match[1]) {
-              targetFmt = `bv*[height<=?${match[1]}]+ba/b[height<=?${match[1]}]/bv*+ba/b`;
-            } else {
-              targetFmt = `${format}/bv*+ba/b`;
-            }
-          }
-          dArgs.push('-f', targetFmt, '--merge-output-format', 'mp4', '-o', tmpTemplate, cleanUrl);
-        }
-        return dArgs;
-      }
-      const retryResult = await runYtdlp(buildDownloadArgsAlt(cookiesPath, 'android_vr,tv_embedded'));
-      if (retryResult.code === 0) {
-        result = retryResult;
-      } else if (cookiesPath) {
-        console.warn('[DOWNLOAD] Retry with cookies failed. Trying without cookies...');
-        const lastResult = await runYtdlp(buildDownloadArgsAlt(null, 'android_vr,tv_embedded'));
-        if (lastResult.code === 0) result = lastResult;
-      }
-    } else if (cookiesPath) {
-      console.warn('[DOWNLOAD] yt-dlp failed with cookies. Retrying download without cookies...');
-      result = await runYtdlp(buildDownloadArgs(null));
-    }
   }
 
   if (result.code !== 0) {
