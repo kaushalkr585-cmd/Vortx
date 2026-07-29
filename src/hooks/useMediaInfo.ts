@@ -29,6 +29,7 @@ export type VortxErrorCode =
   | 'INVALID_URL'
   | 'MISSING_URL'
   | 'PARSE_ERROR'
+  | 'STREAM_UNAVAILABLE'
   | 'UNKNOWN';
 
 export const ERROR_MESSAGES: Record<VortxErrorCode, { title: string; message: string; solution: string }> = {
@@ -86,6 +87,11 @@ export const ERROR_MESSAGES: Record<VortxErrorCode, { title: string; message: st
     title: 'Extraction Failed',
     message: 'Failed to extract video information. YouTube may have changed its format.',
     solution: 'Try again in a few seconds. If the problem persists, yt-dlp may need an update.',
+  },
+  STREAM_UNAVAILABLE: {
+    title: 'Stream Unavailable',
+    message: 'Could not retrieve a download stream. All providers are currently unavailable.',
+    solution: 'Try again in a few seconds, or try a different video.',
   },
   NETWORK_ERROR: {
     title: 'Network Error',
