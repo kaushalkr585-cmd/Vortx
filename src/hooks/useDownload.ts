@@ -80,7 +80,36 @@ export function useDownload() {
         return;
       }
 
-      // Stream the response blob and trigger a browser download
+      // ── Check for Invidious CDN redirect (JSON with directUrl) ──────────
+      // When yt-dlp is bot-blocked, the backend returns the direct YouTube
+      // CDN URL as JSON. We must use an <a> tag (not fetch) to open it,
+      // because fetch() follows the redirect but gets CORS-blocked by
+      // googlevideo.com, while anchor navigation is never CORS-restricted.
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        try {
+          const json = await response.json();
+          if (json.redirect === true && json.directUrl) {
+            setState({
+              status: 'downloading',
+              progress: { percent: 50, speed: 'Opening CDN link…', eta: 'Starting' },
+            });
+            const a = document.createElement('a');
+            a.href = json.directUrl;
+            a.download = json.filename || filename;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setState({ status: 'complete', filename: json.filename || filename });
+            return;
+          }
+        } catch { /* not a redirect JSON — fall through to blob */ }
+      }
+
+      // ── Normal path: stream blob from server and save ───────────────────
       setState({
         status: 'downloading',
         progress: { percent: 30, speed: 'Streaming from server…', eta: 'Almost ready' },

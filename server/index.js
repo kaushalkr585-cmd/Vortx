@@ -549,10 +549,19 @@ async function tryInvidiousDownload(res, videoId, format, isAudio, safeFilename)
       }
 
       if (directUrl) {
-        console.log(`[INVIDIOUS] ✓ Got direct CDN URL from ${instance} — redirecting client`);
-        // Content-Disposition hint (browser may override based on URL)
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-        return res.redirect(302, directUrl);
+        console.log(`[INVIDIOUS] ✓ Got direct CDN URL from ${instance} — returning as JSON`);
+        // Return as JSON so the frontend can open it via <a> tag.
+        // We CANNOT use res.redirect() here because the frontend uses fetch(),
+        // and fetch() follows redirects but then gets CORS-blocked on googlevideo.com.
+        // Navigation via <a href> is NOT subject to CORS restrictions.
+        res.json({
+          success: true,
+          directUrl,
+          redirect: true,
+          filename: safeFilename,
+          source: 'invidious',
+        });
+        return true;
       }
     } catch (e) {
       console.warn(`[INVIDIOUS] ${instance} failed: ${e.message}`);
