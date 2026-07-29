@@ -326,11 +326,11 @@ function buildBaseArgs(cookiesPath, clientOverride) {
     '--add-header', 'Origin:https://www.youtube.com',
     // Player client
     '--extractor-args', `youtube:player_client=${playerClient}`,
-    // Retry & resilience (keep timeouts low on cloud servers)
-    '--socket-timeout', '8',
-    '--retries', '1',
-    '--extractor-retries', '1',
-    '--fragment-retries', '1',
+    // Retry & resilience settings
+    '--socket-timeout', '30',
+    '--retries', '3',
+    '--extractor-retries', '3',
+    '--fragment-retries', '10',
     // Bypass geographic restrictions
     '--geo-bypass',
     '--no-check-certificates',
@@ -356,8 +356,10 @@ function buildBaseArgs(cookiesPath, clientOverride) {
  */
 async function runWithBotBypass(extraArgs, cookiesPath) {
   const attempts = [
-    { client: 'tv_embedded', cp: cookiesPath, label: 'tv_embedded+cookies' },
     { client: 'android_vr',  cp: cookiesPath, label: 'android_vr+cookies'  },
+    { client: 'tv_embedded', cp: cookiesPath, label: 'tv_embedded+cookies' },
+    { client: 'android',     cp: cookiesPath, label: 'android+cookies'     },
+    { client: 'web',         cp: cookiesPath, label: 'web+cookies'         },
   ];
 
   let lastResult;
@@ -369,14 +371,8 @@ async function runWithBotBypass(extraArgs, cookiesPath) {
       console.log(`[BOT-BYPASS] Success with: ${attempt.label}`);
       return result;
     }
+    console.warn(`[BOT-BYPASS] ${attempt.label} failed with code ${result.code}: ${result.stderr.trim().slice(0, 150)}`);
     lastResult = result;
-    const errText = result.stderr || '';
-    // If it's NOT a bot detection error, stop retrying (different error type)
-    const isBotOrAuth = /Sign in to confirm|not a bot|bot detection|confirm you're not a bot|please verify|authentication|This video is unavailable/i.test(errText);
-    if (!isBotOrAuth) {
-      console.warn(`[BOT-BYPASS] Non-bot error on ${attempt.label}, stopping retries.`);
-      break;
-    }
   }
   return lastResult;
 }
@@ -1020,7 +1016,7 @@ app.get('/api/stream', async (req, res) => {
     );
   } else {
     downloadExtraArgs.push(
-      '-f', `bv*[height<=?${height}]+ba/b`,
+      '-f', `bv*[height<=?${height}]+ba/b[height<=?${height}]/bv*+ba/b/best`,
       '--merge-output-format', 'mp4',
       '-o', tmpTemplate,
       cleanUrl
@@ -1129,14 +1125,14 @@ app.get('/api/download', async (req, res) => {
       cleanUrl
     );
   } else {
-    let targetFmt = 'bv*+ba/b';
+    let targetFmt = 'bv*+ba/b/best';
     if (format) {
       const match = format.match(/height<=?\??(\d+)/);
       if (match && match[1]) {
         const h = match[1];
-        targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b`;
+        targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b/best`;
       } else {
-        targetFmt = `${format}/bv*+ba/b`;
+        targetFmt = `${format}/bv*+ba/b/best`;
       }
     }
     console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
