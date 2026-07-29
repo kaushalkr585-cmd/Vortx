@@ -9,6 +9,7 @@ const { spawn, execSync } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 // ─── FFmpeg Resolution ────────────────────────────────────────
 let ffmpegPath = null;
@@ -451,6 +452,85 @@ function runYtdlp(args) {
   });
 }
 
+// ─── YouTube oEmbed Fallback ──────────────────────────────────
+/**
+ * When yt-dlp is blocked by bot detection on cloud IPs, this uses
+ * YouTube's free public oEmbed API to get basic metadata.
+ * No authentication, no cookies, works from any IP.
+ */
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`));
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+async function fetchYouTubeOEmbed(videoUrl) {
+  const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
+  const raw = await httpsGet(url);
+  return JSON.parse(raw);
+}
+
+function extractVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.includes('youtube.com')) {
+      return parsed.searchParams.get('v') || null;
+    }
+    if (parsed.hostname === 'youtu.be') {
+      return parsed.pathname.split('/').filter(Boolean)[0] || null;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function buildOEmbedResponse(rawUrl, oembed) {
+  const videoId = extractVideoId(rawUrl);
+  const thumbnail = videoId
+    ? `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
+    : (oembed.thumbnail_url || null);
+
+  // Standard resolution presets — shown since we can't get exact formats via oEmbed
+  const videoFormats = [
+    { id: 'bestvideo[height<=?360]+bestaudio/best',  label: '360p',        resolution: '640×360',   codec: 'H.264 / AAC', fps: 30, container: 'MP4', estimatedSize: '~45 MB' },
+    { id: 'bestvideo[height<=?480]+bestaudio/best',  label: '480p',        resolution: '854×480',   codec: 'H.264 / AAC', fps: 30, container: 'MP4', estimatedSize: '~78 MB' },
+    { id: 'bestvideo[height<=?720]+bestaudio/best',  label: '720p HD',     resolution: '1280×720',  codec: 'H.264 / AAC', fps: 30, container: 'MP4', estimatedSize: '~135 MB' },
+    { id: 'bestvideo[height<=?1080]+bestaudio/best', label: '1080p Full HD', resolution: '1920×1080', codec: 'H.264 / AAC', fps: 30, container: 'MP4', estimatedSize: '~220 MB', recommended: true },
+  ];
+
+  const audioFormats = [
+    { id: 'bestaudio/best', bitrate: '128 kbps', codec: 'MP3', estimatedSize: '~8 MB',  audioQuality: '5' },
+    { id: 'bestaudio/best', bitrate: '192 kbps', codec: 'MP3', estimatedSize: '~14 MB', audioQuality: '3' },
+    { id: 'bestaudio/best', bitrate: '256 kbps', codec: 'MP3', estimatedSize: '~19 MB', audioQuality: '2', recommended: true },
+    { id: 'bestaudio/best', bitrate: '320 kbps', codec: 'MP3', estimatedSize: '~24 MB', audioQuality: '0' },
+  ];
+
+  return {
+    success: true,
+    url: rawUrl,
+    title: oembed.title || 'Untitled',
+    uploader: oembed.author_name || 'Unknown',
+    uploaderAvatar: `https://api.dicebear.com/7.x/identicon/svg?seed=${encodeURIComponent(oembed.author_name || 'vortx')}`,
+    thumbnail,
+    duration: '—',
+    viewCount: null,
+    publishedAt: null,
+    platform: 'youtube',
+    videoFormats,
+    audioFormats,
+    _source: 'oembed', // internal flag — metadata via oEmbed fallback
+  };
+}
+
 // ─── /api/info ────────────────────────────────────────────────
 app.get('/api/info', async (req, res) => {
   const rawUrl = req.query.url;
@@ -496,6 +576,24 @@ app.get('/api/info', async (req, res) => {
   if (result.code !== 0) {
     console.error(`[INFO] yt-dlp exited ${result.code}: ${result.stderr.slice(0, 500)}`);
     const parsed = parseYtdlpError(result.stderr);
+    const isBotBlocked = parsed.code === 'BOT_DETECTED';
+    const isYouTube = cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be');
+
+    // ── oEmbed fallback for YouTube bot detection on cloud IPs ──
+    if (isBotBlocked && isYouTube) {
+      console.warn('[INFO] All yt-dlp clients blocked. Falling back to YouTube oEmbed API...');
+      try {
+        const oembed = await fetchYouTubeOEmbed(cleanUrl);
+        const response = buildOEmbedResponse(rawUrl, oembed);
+        setCache(cleanUrl, response);
+        console.log(`[INFO] oEmbed fallback success for: ${cleanUrl}`);
+        return res.json(response);
+      } catch (oembedErr) {
+        console.error('[INFO] oEmbed fallback also failed:', oembedErr.message);
+        // Fall through to return the original bot-detected error
+      }
+    }
+
     return res.status(422).json({
       success: false,
       ...parsed,
