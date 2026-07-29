@@ -563,6 +563,51 @@ function proxyStreamToClient(res, streamUrl, filename, isAudio) {
 
 /** Races all providers in parallel and returns the first working stream URL. */
 async function resolveYouTubeStreamUrl(videoId, isAudio, targetHeight) {
+  // ─ Direct InnerTube helper (ANDROID_VR client)
+  async function innerTubePromise() {
+    const raw = await new Promise((resolve, reject) => {
+      const body = JSON.stringify({
+        videoId: videoId,
+        context: { client: { clientName: 'ANDROID_VR', clientVersion: '1.50.11', deviceModel: 'Quest 3', osName: 'Android', osVersion: '12', hl: 'en', gl: 'US' } }
+      });
+      const r = https.request({
+        hostname: 'www.youtube.com', path: '/youtubei/v1/player', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+        timeout: 6000
+      }, (res) => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => resolve(d));
+      });
+      r.on('error', reject);
+      r.on('timeout', () => { r.destroy(); reject(new Error('InnerTube timeout')); });
+      r.write(body);
+      r.end();
+    });
+
+    const data = JSON.parse(raw);
+    const formats = data.streamingData ? [...(data.streamingData.formats || []), ...(data.streamingData.adaptiveFormats || [])] : [];
+    let url = null;
+    if (isAudio) {
+      const audioStreams = formats.filter(f => f.url && f.mimeType && f.mimeType.startsWith('audio/'));
+      audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      url = audioStreams[0]?.url || null;
+    } else {
+      const muxed = formats.filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/') && f.height);
+      if (muxed.length > 0) {
+        muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
+        const match = muxed.find(f => (f.height || 9999) <= targetHeight) || muxed[muxed.length - 1];
+        url = match?.url || null;
+      } else {
+        const videoStreams = formats.filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/'));
+        videoStreams.sort((a, b) => (b.height || 0) - (a.height || 0));
+        url = videoStreams[0]?.url || null;
+      }
+    }
+    if (!url) throw new Error('No direct stream URL from InnerTube');
+    return url;
+  }
+
   // ─ Cobalt helper (updated API: POST / with vQuality)
   function cobaltPromise() {
     return new Promise((resolve, reject) => {
@@ -656,6 +701,7 @@ async function resolveYouTubeStreamUrl(videoId, isAudio, targetHeight) {
   try {
     const url = await Promise.race([
       Promise.any([
+        innerTubePromise(),
         cobaltPromise(),
         pipedPromise('https://pipedapi.kavin.rocks'),
         pipedPromise('https://api.piped.yt'),
@@ -989,16 +1035,7 @@ app.get('/api/download', async (req, res) => {
       }
     }
 
-    // All providers failed — return a clean JSON error within Render's timeout
-    if (!res.headersSent) {
-      return res.status(503).json({
-        success: false,
-        code: 'STREAM_UNAVAILABLE',
-        message: 'Could not retrieve a download stream from any provider.',
-        solution: 'Try again in a few seconds, or try a different video.',
-      });
-    }
-    return;
+    console.log('[DOWNLOAD] Fast-path stream proxy unavailable. Falling back to server-side yt-dlp download...');
   }
 
   // Non-YouTube (Instagram etc.) — use yt-dlp

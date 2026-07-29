@@ -41,8 +41,63 @@ export default async function handler(request) {
     return Response.json({ error: 'Missing videoId' }, { status: 400, headers: CORS_HEADERS });
   }
 
-  // ── Try Piped (server-to-server, no CORS) ───────────────────────
   let streamUrl = null;
+
+  // ── Try Direct YouTube InnerTube API (ANDROID_VR Client) ────────
+  try {
+    const ytResp = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: 'ANDROID_VR',
+            clientVersion: '1.50.11',
+            deviceModel: 'Quest 3',
+            osName: 'Android',
+            osVersion: '12',
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (ytResp.ok) {
+      const data = await ytResp.json();
+      const formats = data.streamingData
+        ? [...(data.streamingData.formats || []), ...(data.streamingData.adaptiveFormats || [])]
+        : [];
+
+      if (isAudio) {
+        const audioStreams = formats.filter(f => f.url && f.mimeType && f.mimeType.startsWith('audio/'));
+        audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        streamUrl = audioStreams[0]?.url || null;
+      } else {
+        const muxed = formats.filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/') && f.height);
+        if (muxed.length > 0) {
+          muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
+          const match = muxed.find(f => (f.height || 9999) <= height) || muxed[muxed.length - 1];
+          streamUrl = match?.url || null;
+        } else {
+          const videoStreams = formats.filter(f => f.url && f.mimeType && f.mimeType.startsWith('video/'));
+          videoStreams.sort((a, b) => (b.height || 0) - (a.height || 0));
+          streamUrl = videoStreams[0]?.url || null;
+        }
+      }
+      if (streamUrl) console.log('[EDGE] InnerTube ANDROID_VR → got stream URL');
+    }
+  } catch (e) {
+    console.warn(`[EDGE] InnerTube ANDROID_VR failed: ${e.message}`);
+  }
+
+  // ── Try Piped (server-to-server, fallback) ─────────────────────
+  if (!streamUrl) {
 
   for (const instance of PIPED_INSTANCES) {
     try {
@@ -78,6 +133,7 @@ export default async function handler(request) {
     } catch (e) {
       console.warn(`[EDGE] Piped ${instance} failed: ${e.message}`);
     }
+  }
   }
 
   // ── Try Cobalt as fallback (updated API: POST / with vQuality) ──────────────
