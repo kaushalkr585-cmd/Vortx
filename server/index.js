@@ -208,6 +208,13 @@ function parseYtdlpError(stderr) {
       solution: 'Please check that you copied the full YouTube or Instagram URL.',
     };
   }
+  if (/Instagram.*empty media response|login.*required|checkpoint.*required|Please.*log in/i.test(s)) {
+    return {
+      code: 'BOT_DETECTED',
+      message: 'Instagram requires you to be logged in to download this content.',
+      solution: 'Export your Instagram cookies from your browser (using a browser extension like "Get cookies.txt") and save them to server/cookies.txt alongside your YouTube cookies.',
+    };
+  }
   if (/Sign in to confirm|not a bot|bot detection|confirm you're not a bot/i.test(s)) {
     return {
       code: 'BOT_DETECTED',
@@ -300,60 +307,63 @@ function parseYtdlpError(stderr) {
   };
 }
 
-// ─── Shared yt-dlp Args Builder ───────────────────────────────
+// ─── Shared yt-dlp Args Builder (YouTube) ────────────────────
 /**
- * Returns the base yt-dlp arguments that apply to both /api/info and /api/download.
+ * Returns the base yt-dlp arguments for YouTube URLs.
  * These mimic a real browser session and use multiple client fallbacks.
  */
 function buildBaseArgs(cookiesPath, clientOverride) {
-  // Player client strategy:
-  //   web          — full auth with cookies, best quality, needs JS runtime on server IPs
-  //   tv_embedded  — works on server IPs, no JS runtime needed, good bot bypass
-  //   android_vr   — secondary fallback, bypasses JS challenges
-  //   web_creator  — creator client, sometimes bypasses bot detection differently
-  //   mweb         — mobile web, last resort
   const playerClient = clientOverride || 'tv_embedded,android_vr,web';
 
   const args = [
     '--no-playlist',
     '--no-warnings',
-    // Realistic Chrome user agent
     '--user-agent',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    // Add HTTP headers that real browsers send
     '--add-header', 'Accept-Language:en-US,en;q=0.9',
     '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     '--add-header', 'Origin:https://www.youtube.com',
-    // Player client
     '--extractor-args', `youtube:player_client=${playerClient}`,
-    // Retry & resilience settings
     '--socket-timeout', '30',
     '--retries', '3',
     '--extractor-retries', '3',
     '--fragment-retries', '10',
-    // Bypass geographic restrictions
     '--geo-bypass',
     '--no-check-certificates',
   ];
 
-  if (cookiesPath) {
-    args.push('--cookies', cookiesPath);
-  }
-
+  if (cookiesPath) args.push('--cookies', cookiesPath);
   return args;
 }
 
-// ─── Exhaustive Bot-Detection Bypass Runner ───────────────────
+// ─── Instagram Args Builder ────────────────────────────────────
 /**
- * Tries yt-dlp with multiple client/cookie combinations in sequence.
- * Returns the first successful result, or the last failed result.
- * Attempts (in order):
- *   1. tv_embedded + cookies       — best for cloud IPs with auth
- *   2. web_creator + cookies       — alternate client with auth
- *   3. android_vr + cookies        — no JS runtime needed
- *   4. tv_embedded (no cookies)    — unauthenticated fallback
- *   5. android_vr (no cookies)     — last resort
+ * Returns yt-dlp args tailored for Instagram.
+ * Does NOT include YouTube-specific headers or player_client args.
  */
+function buildInstagramArgs(cookiesPath) {
+  const args = [
+    '--no-playlist',
+    '--no-warnings',
+    '--user-agent',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    '--add-header', 'Origin:https://www.instagram.com',
+    '--add-header', 'Referer:https://www.instagram.com/',
+    '--socket-timeout', '30',
+    '--retries', '3',
+    '--extractor-retries', '3',
+    '--fragment-retries', '10',
+    '--geo-bypass',
+    '--no-check-certificates',
+  ];
+
+  if (cookiesPath) args.push('--cookies', cookiesPath);
+  return args;
+}
+
+// ─── YouTube Bot-Detection Bypass Runner ─────────────────────
 async function runWithBotBypass(extraArgs, cookiesPath) {
   const attempts = [
     { client: 'android_vr',  cp: cookiesPath, label: 'android_vr+cookies'  },
@@ -375,6 +385,33 @@ async function runWithBotBypass(extraArgs, cookiesPath) {
     lastResult = result;
   }
   return lastResult;
+}
+
+// ─── Instagram Runner ─────────────────────────────────────────
+/**
+ * Runs yt-dlp for Instagram URLs with Instagram-specific args.
+ * Tries with cookies first, then cookies-from-browser as fallback.
+ */
+async function runInstagram(extraArgs, cookiesPath) {
+  const baseArgs = buildInstagramArgs(cookiesPath);
+  console.log('[INSTAGRAM] Trying with cookies...');
+  const result = await runYtdlp([...baseArgs, ...extraArgs]);
+  if (result.code === 0) {
+    console.log('[INSTAGRAM] Success with cookies.');
+    return result;
+  }
+  console.warn('[INSTAGRAM] Cookies failed:', result.stderr.trim().slice(0, 150));
+
+  // Fallback: try with no cookies (public content)
+  const noAuthArgs = buildInstagramArgs(null);
+  console.log('[INSTAGRAM] Trying without cookies...');
+  const result2 = await runYtdlp([...noAuthArgs, ...extraArgs]);
+  if (result2.code === 0) {
+    console.log('[INSTAGRAM] Success without cookies.');
+    return result2;
+  }
+  console.warn('[INSTAGRAM] No-cookies also failed:', result2.stderr.trim().slice(0, 150));
+  return result2;
 }
 
 // ─── Health Check ─────────────────────────────────────────────
@@ -803,9 +840,12 @@ app.get('/api/info', async (req, res) => {
   }
 
   const cookiesPath = getCookiesPath();
+  const isInstagramUrl = cleanUrl.includes('instagram.com');
 
-  // Use exhaustive bot-bypass runner for /api/info
-  let result = await runWithBotBypass(['--dump-json', cleanUrl], cookiesPath);
+  // Route to the correct runner based on URL platform
+  let result = isInstagramUrl
+    ? await runInstagram(['--dump-json', cleanUrl], cookiesPath)
+    : await runWithBotBypass(['--dump-json', cleanUrl], cookiesPath);
 
   if (result.spawnError) {
     return res.status(503).json({
@@ -1131,8 +1171,11 @@ app.get('/api/download', async (req, res) => {
 
   const cookiesPath = getCookiesPath();
 
-  // Use exhaustive bot-bypass runner for /api/download
-  let result = await runWithBotBypass(downloadExtraArgs, cookiesPath);
+  const isInstagramDownload = cleanUrl.includes('instagram.com');
+  // Use platform-specific runner
+  let result = isInstagramDownload
+    ? await runInstagram(downloadExtraArgs, cookiesPath)
+    : await runWithBotBypass(downloadExtraArgs, cookiesPath);
 
   if (result.spawnError) {
     return res.status(503).json({
