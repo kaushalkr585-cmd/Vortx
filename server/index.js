@@ -26,7 +26,16 @@ try {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(cors({ origin: '*', credentials: false }));
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
 app.use(express.json());
 
 // ─── In-Memory Metadata Cache (5-min TTL) ────────────────────
@@ -317,11 +326,11 @@ function buildBaseArgs(cookiesPath, clientOverride) {
     '--add-header', 'Origin:https://www.youtube.com',
     // Player client
     '--extractor-args', `youtube:player_client=${playerClient}`,
-    // Retry & resilience
-    '--retries', '3',
-    '--extractor-retries', '3',
-    '--fragment-retries', '3',
-    '--retry-sleep', 'linear=1::3',
+    // Retry & resilience (keep timeouts low on cloud servers)
+    '--socket-timeout', '8',
+    '--retries', '1',
+    '--extractor-retries', '1',
+    '--fragment-retries', '1',
     // Bypass geographic restrictions
     '--geo-bypass',
     '--no-check-certificates',
@@ -347,11 +356,8 @@ function buildBaseArgs(cookiesPath, clientOverride) {
  */
 async function runWithBotBypass(extraArgs, cookiesPath) {
   const attempts = [
-    { client: 'tv_embedded',           cp: cookiesPath, label: 'tv_embedded+cookies'    },
-    { client: 'web_creator,tv_embedded', cp: cookiesPath, label: 'web_creator+cookies'  },
-    { client: 'android_vr',            cp: cookiesPath, label: 'android_vr+cookies'     },
-    { client: 'tv_embedded',           cp: null,        label: 'tv_embedded (no cookies)' },
-    { client: 'android_vr',            cp: null,        label: 'android_vr (no cookies)' },
+    { client: 'tv_embedded', cp: cookiesPath, label: 'tv_embedded+cookies' },
+    { client: 'android_vr',  cp: cookiesPath, label: 'android_vr+cookies'  },
   ];
 
   let lastResult;
@@ -555,6 +561,51 @@ async function tryAlternativeDownload(res, videoId, format, isAudio, safeFilenam
   if (format) {
     const m = format.match(/height<=?\??(\d+)/);
     if (m && m[1]) targetHeight = parseInt(m[1]);
+  }
+
+  // ── 0. Try Cobalt API ──────────────────────────────────────────
+  try {
+    console.log(`[COBALT] Trying Cobalt API for videoId=${videoId}...`);
+    const cobaltReq = JSON.stringify({
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      videoQuality: String(targetHeight),
+      isAudioOnly: Boolean(isAudio),
+    });
+
+    const options = {
+      hostname: 'api.cobalt.tools',
+      path: '/api/json',
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Content-Length': Buffer.byteLength(cobaltReq),
+      },
+      timeout: 7000,
+    };
+
+    const raw = await new Promise((resolve, reject) => {
+      const r = https.request(options, (cRes) => {
+        let d = '';
+        cRes.on('data', chunk => d += chunk);
+        cRes.on('end', () => resolve(d));
+      });
+      r.on('error', reject);
+      r.on('timeout', () => { r.destroy(); reject(new Error('timeout')); });
+      r.write(cobaltReq);
+      r.end();
+    });
+
+    const parsed = JSON.parse(raw);
+    const streamUrl = parsed.url;
+    if (streamUrl) {
+      console.log(`[COBALT] Got stream URL, proxying to client...`);
+      const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
+      if (ok) return true;
+    }
+  } catch (e) {
+    console.warn(`[COBALT] Cobalt failed: ${e.message}`);
   }
 
   // ── 1. Try Piped (Piped proxies YouTube themselves) ────────────
@@ -921,8 +972,21 @@ app.get('/api/download', async (req, res) => {
   const fileId = `vortx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const tmpTemplate = path.join(os.tmpdir(), `${fileId}.%(ext)s`);
   const cleanUrl = sanitizeUrl(urlResult.href);
+  const isYouTube = cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be');
+  const videoId = extractVideoId(cleanUrl);
 
   console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
+
+  // ── FAST PATH: Try Cobalt / Piped / Invidious stream proxying for YouTube ──
+  if (isYouTube && videoId) {
+    console.log(`[DOWNLOAD] Attempting direct stream proxy for YouTube videoId=${videoId}...`);
+    const proxied = await tryAlternativeDownload(res, videoId, format, isAudio, safeFilename);
+    if (proxied) {
+      console.log('[DOWNLOAD] Direct stream proxy succeeded!');
+      return;
+    }
+    console.warn('[DOWNLOAD] Stream proxying returned false, falling back to yt-dlp...');
+  }
 
   // Build the download-specific extra args (format, output path, ffmpeg)
   const downloadExtraArgs = [];
