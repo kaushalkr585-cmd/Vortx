@@ -133,8 +133,28 @@ function sanitizeUrl(rawUrl) {
   if (!rawUrl) return rawUrl;
   try {
     const parsed = new URL(rawUrl);
-    if (parsed.hostname.includes('youtube.com') && parsed.searchParams.has('v')) {
-      const videoId = parsed.searchParams.get('v');
+    const host = parsed.hostname.toLowerCase();
+
+    // Standard youtube.com URLs
+    if (host.includes('youtube.com')) {
+      if (parsed.searchParams.has('v')) {
+        const videoId = parsed.searchParams.get('v');
+        if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+          return `https://www.youtube.com/watch?v=${videoId}`;
+        }
+      }
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      if ((parts[0] === 'shorts' || parts[0] === 'embed') && parts[1]) {
+        const videoId = parts[1];
+        if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+          return `https://www.youtube.com/watch?v=${videoId}`;
+        }
+      }
+    }
+
+    // Shortened youtu.be URLs
+    if (host === 'youtu.be') {
+      const videoId = parsed.pathname.replace(/^\//, '').split('/')[0];
       if (/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
         return `https://www.youtube.com/watch?v=${videoId}`;
       }
@@ -150,7 +170,14 @@ function sanitizeUrl(rawUrl) {
 function parseYtdlpError(stderr) {
   const s = stderr || '';
 
-  if (/Sign in to confirm|not a bot|bot detection/i.test(s)) {
+  if (/Incomplete YouTube ID|Unsupported URL|is not a valid URL|not a supported/i.test(s)) {
+    return {
+      code: 'INVALID_URL',
+      message: 'The URL or video ID is invalid or incomplete.',
+      solution: 'Please check that you copied the full YouTube or Instagram URL.',
+    };
+  }
+  if (/Sign in to confirm|not a bot|bot detection|confirm you're not a bot/i.test(s)) {
     return {
       code: 'BOT_DETECTED',
       message: 'YouTube requires authentication to verify this request is from a real user.',
@@ -192,7 +219,7 @@ function parseYtdlpError(stderr) {
       solution: 'Wait until the stream ends, then the video will be available for download.',
     };
   }
-  if (/video.?unavailable|has been removed|no longer available/i.test(s)) {
+  if (/video.?unavailable|has been removed|no longer available|404 Not Found/i.test(s)) {
     return {
       code: 'VIDEO_UNAVAILABLE',
       message: 'This video has been removed or is no longer available.',
@@ -220,7 +247,7 @@ function parseYtdlpError(stderr) {
       solution: 'FFmpeg is not installed or not found. Contact the server administrator.',
     };
   }
-  if (/Unable to extract|Failed to extract|ExtractorError/i.test(s)) {
+  if (/Unable to extract|Failed to extract|ExtractorError|Requested format is not available/i.test(s)) {
     return {
       code: 'EXTRACTOR_ERROR',
       message: 'Failed to extract video information from this URL.',
@@ -245,34 +272,30 @@ function parseYtdlpError(stderr) {
 // ─── Shared yt-dlp Args Builder ───────────────────────────────
 /**
  * Returns the base yt-dlp arguments that apply to both /api/info and /api/download.
- * These mimic a real browser session as closely as possible.
+ * These mimic a real browser session and use multiple client fallbacks.
  */
 function buildBaseArgs(cookiesPath) {
   const args = [
     '--no-playlist',
     '--no-warnings',
-    // Realistic Chrome 126 user agent
+    // Realistic Chrome user agent
     '--user-agent',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     // Add HTTP headers that real browsers send
     '--add-header', 'Accept-Language:en-US,en;q=0.9',
     '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    // JS runtime for YouTube n-challenge decryption (required by yt-dlp 2026.07+)
-    // Without these two flags, yt-dlp cannot decrypt CDN URLs and fails with
-    // "Requested format is not available" — they are NOT optional.
+    // Multiple YouTube player client fallbacks to bypass bot detection on cloud IPs (Render/AWS/etc.)
+    '--extractor-args', 'youtube:player_client=mweb,android,ios,web',
+    // JS runtime for n-challenge evaluation
     '--js-runtimes', 'node',
-    '--remote-components', 'ejs:github',
     // Retry & resilience
     '--retries', '3',
     '--extractor-retries', '3',
     '--fragment-retries', '3',
     '--retry-sleep', 'linear=1::2',
-    // Polite request pacing to avoid triggering rate-limit
-    '--sleep-requests', '1',
-    '--sleep-interval', '2',
     // Bypass geographic restrictions
     '--geo-bypass',
-    // Skip HTTPS certificate errors (some VPS have outdated certs)
+    // Skip HTTPS certificate errors
     '--no-check-certificates',
   ];
 
@@ -369,7 +392,6 @@ app.get('/api/info', async (req, res) => {
   const args = [
     ...buildBaseArgs(cookiesPath),
     '--dump-json',
-    '--quiet',
     cleanUrl,
   ];
 
