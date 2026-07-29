@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // VORTX Backend Server — Production-Grade yt-dlp Engine
 // Port: 3001
 // ============================================================
@@ -162,7 +162,8 @@ function validateUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return { valid: false, reason: 'EMPTY' };
   const trimmed = rawUrl.trim();
   if (trimmed.length > 2048) return { valid: false, reason: 'TOO_LONG' };
-  if (/[;&|`$<>{}[\]\\]/.test(trimmed)) return { valid: false, reason: 'MALFORMED' };
+  // & is valid in URL query strings (including Instagram share links)
+  if (/[;|`$<>{}[\]\\]/.test(trimmed)) return { valid: false, reason: 'MALFORMED' };
 
   try {
     const parsed = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
