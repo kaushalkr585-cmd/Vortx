@@ -597,7 +597,7 @@ app.get('/api/info', async (req, res) => {
 });
 
 // ─── /api/download ────────────────────────────────────────────
-app.get('/api/download', (req, res) => {
+app.get('/api/download', async (req, res) => {
   const { url: rawUrl, format, filename, type, audioQuality } = req.query;
 
   if (!rawUrl) {
@@ -627,137 +627,132 @@ app.get('/api/download', (req, res) => {
 
   console.log(`[DOWNLOAD] ${type} | ${cleanUrl} | format=${format}`);
 
-  const cookiesPath = getCookiesPath();
-  const args = [...buildBaseArgs(cookiesPath)];
+  function buildDownloadArgs(cp) {
+    const dArgs = [...buildBaseArgs(cp)];
 
-  if (ffmpegPath) {
-    args.push('--ffmpeg-location', ffmpegPath);
-  }
-
-  if (isAudio) {
-    const quality = audioQuality || '2';
-    args.push(
-      '-f', 'bestaudio/best',
-      '--extract-audio',
-      '--audio-format', 'mp3',
-      '--audio-quality', quality,
-      '-o', tmpTemplate,
-      cleanUrl
-    );
-  } else {
-    let targetFmt = 'bv*+ba/b';
-    if (format) {
-      const match = format.match(/height<=?\??(\d+)/);
-      if (match && match[1]) {
-        const h = match[1];
-        targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b`;
-      } else {
-        targetFmt = `${format}/bv*+ba/b`;
-      }
+    if (ffmpegPath) {
+      dArgs.push('--ffmpeg-location', ffmpegPath);
     }
-    console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
-    args.push(
-      '-f', targetFmt,
-      '--merge-output-format', 'mp4',
-      '-o', tmpTemplate,
-      cleanUrl
-    );
+
+    if (isAudio) {
+      const quality = audioQuality || '2';
+      dArgs.push(
+        '-f', 'bestaudio/best',
+        '--extract-audio',
+        '--audio-format', 'mp3',
+        '--audio-quality', quality,
+        '-o', tmpTemplate,
+        cleanUrl
+      );
+    } else {
+      let targetFmt = 'bv*+ba/b';
+      if (format) {
+        const match = format.match(/height<=?\??(\d+)/);
+        if (match && match[1]) {
+          const h = match[1];
+          targetFmt = `bv*[height<=?${h}]+ba/b[height<=?${h}]/bv*+ba/b`;
+        } else {
+          targetFmt = `${format}/bv*+ba/b`;
+        }
+      }
+      console.log(`[DOWNLOAD] format selector: ${targetFmt}`);
+      dArgs.push(
+        '-f', targetFmt,
+        '--merge-output-format', 'mp4',
+        '-o', tmpTemplate,
+        cleanUrl
+      );
+    }
+    return dArgs;
   }
 
-  const proc = spawn('yt-dlp', args);
-  let errOutput = '';
+  const cookiesPath = getCookiesPath();
+  let result = await runYtdlp(buildDownloadArgs(cookiesPath));
 
-  proc.on('error', (err) => {
-    console.error('[DOWNLOAD] Failed to spawn yt-dlp:', err.message);
+  if (result.spawnError) {
+    return res.status(503).json({
+      success: false,
+      code: 'YTDLP_NOT_FOUND',
+      message: 'yt-dlp is not installed on the server.',
+      solution: 'Run: pip install yt-dlp',
+    });
+  }
+
+  // If download failed with cookies, retry WITHOUT cookies
+  if (result.code !== 0 && cookiesPath) {
+    console.warn('[DOWNLOAD] yt-dlp failed with cookies. Retrying download without cookies...');
+    result = await runYtdlp(buildDownloadArgs(null));
+  }
+
+  if (result.code !== 0) {
+    console.error(`[DOWNLOAD] yt-dlp exited ${result.code}: ${result.stderr.slice(0, 500)}`);
     if (!res.headersSent) {
-      res.status(503).json({
+      const parsed = parseYtdlpError(result.stderr);
+      return res.status(422).json({
         success: false,
-        code: 'YTDLP_NOT_FOUND',
-        message: 'yt-dlp is not installed on the server.',
-        solution: 'Run: pip install yt-dlp',
+        ...parsed,
+        details: result.stderr.trim().slice(0, 300),
       });
     }
-  });
+    return;
+  }
 
-  proc.stderr.on('data', (chunk) => {
-    const msg = chunk.toString();
-    errOutput += msg;
-    process.stdout.write('[yt-dlp] ' + msg);
-  });
+  const tmpDir = os.tmpdir();
+  let matchingFiles = [];
+  try {
+    matchingFiles = fs.readdirSync(tmpDir).filter(
+      f => f.startsWith(fileId) && !f.endsWith('.part') && !f.endsWith('.ytdl')
+    );
+  } catch (e) {
+    console.error('[DOWNLOAD] Failed to read temp directory:', e);
+  }
 
-  proc.on('close', (code) => {
-    if (code !== 0) {
-      console.error(`[DOWNLOAD] yt-dlp exited ${code}`);
-      if (!res.headersSent) {
-        const parsed = parseYtdlpError(errOutput);
-        res.status(422).json({
-          success: false,
-          ...parsed,
-          details: errOutput.trim().slice(0, 300),
-        });
-      }
-      return;
+  if (matchingFiles.length === 0) {
+    console.error('[DOWNLOAD] No output file found for prefix:', fileId);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        code: 'OUTPUT_MISSING',
+        message: 'Download completed but output file was not found.',
+        solution: 'This may be a server disk space or permissions issue.',
+      });
     }
+    return;
+  }
 
-    const tmpDir = os.tmpdir();
-    let matchingFiles = [];
-    try {
-      matchingFiles = fs.readdirSync(tmpDir).filter(
-        f => f.startsWith(fileId) && !f.endsWith('.part') && !f.endsWith('.ytdl')
-      );
-    } catch (e) {
-      console.error('[DOWNLOAD] Failed to read temp directory:', e);
-    }
+  const actualFilePath = path.join(tmpDir, matchingFiles[0]);
 
-    if (matchingFiles.length === 0) {
-      console.error('[DOWNLOAD] No output file found for prefix:', fileId);
+  fs.stat(actualFilePath, (statErr, stat) => {
+    if (statErr || !stat) {
       if (!res.headersSent) {
         res.status(500).json({
           success: false,
-          code: 'OUTPUT_MISSING',
-          message: 'Download completed but output file was not found.',
-          solution: 'This may be a server disk space or permissions issue.',
+          code: 'FILE_STAT_ERROR',
+          message: 'Failed to access the downloaded file.',
         });
       }
       return;
     }
 
-    const actualFilePath = path.join(tmpDir, matchingFiles[0]);
+    console.log(`[DOWNLOAD] Streaming ${stat.size} bytes → ${safeFilename}`);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
 
-    fs.stat(actualFilePath, (statErr, stat) => {
-      if (statErr || !stat) {
-        if (!res.headersSent) {
-          res.status(500).json({
-            success: false,
-            code: 'FILE_STAT_ERROR',
-            message: 'Failed to access the downloaded file.',
-          });
-        }
-        return;
-      }
+    const readStream = fs.createReadStream(actualFilePath);
+    readStream.pipe(res);
 
-      console.log(`[DOWNLOAD] Streaming ${stat.size} bytes → ${safeFilename}`);
-      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-      res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-      res.setHeader('Content-Length', stat.size);
-
-      const readStream = fs.createReadStream(actualFilePath);
-      readStream.pipe(res);
-
-      const cleanup = () => {
-        fs.unlink(actualFilePath, (err) => {
-          if (!err) console.log(`[DOWNLOAD] Cleaned up: ${actualFilePath}`);
-        });
-      };
-      readStream.on('close', cleanup);
-      readStream.on('error', (err) => {
-        console.error('[DOWNLOAD] Read stream error:', err);
-        cleanup();
+    const cleanup = () => {
+      fs.unlink(actualFilePath, (err) => {
+        if (!err) console.log(`[DOWNLOAD] Cleaned up: ${actualFilePath}`);
       });
+    };
+    readStream.on('close', cleanup);
+    readStream.on('error', (err) => {
+      console.error('[DOWNLOAD] Read stream error:', err);
+      cleanup();
     });
   });
-
-  req.on('close', () => { proc.kill('SIGTERM'); });
 });
 
 // ─── Serve Frontend ───────────────────────────────────────────
