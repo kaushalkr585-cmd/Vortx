@@ -8,7 +8,6 @@
 
 import { useState, useCallback, useRef } from 'react';
 import type { VortxErrorCode } from './useMediaInfo';
-import { ERROR_MESSAGES } from './useMediaInfo';
 
 export type DownloadProgress = {
   percent: number;
