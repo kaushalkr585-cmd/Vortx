@@ -983,6 +983,82 @@ app.get('/api/info', async (req, res) => {
     }
 });
 
+// ─── /api/stream (Local & Edge proxy compatibility) ───────────────
+app.get('/api/stream', async (req, res) => {
+  const videoId = req.query.videoId;
+  const isAudio = req.query.isAudio === 'true';
+  const height = parseInt(req.query.height || '720', 10);
+  const filename = req.query.filename || (isAudio ? 'audio.mp3' : 'video.mp4');
+
+  if (!videoId) {
+    return res.status(400).json({ success: false, code: 'MISSING_ID', message: 'Missing videoId parameter.' });
+  }
+
+  const safeFilename = filename.replace(/[^\w\-. ()]/g, '_').slice(0, 200);
+
+  const streamUrl = await resolveYouTubeStreamUrl(videoId, isAudio, height);
+  if (streamUrl) {
+    const ok = await proxyStreamToClient(res, streamUrl, safeFilename, isAudio);
+    if (ok) return;
+  }
+
+  // Fallback if direct stream proxy unavailable
+  const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const downloadExtraArgs = [];
+  if (ffmpegPath) downloadExtraArgs.push('--ffmpeg-location', ffmpegPath);
+
+  const fileId = `vortx_stream_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const tmpTemplate = path.join(os.tmpdir(), `${fileId}.%(ext)s`);
+
+  if (isAudio) {
+    downloadExtraArgs.push(
+      '-f', 'bestaudio/best',
+      '--extract-audio',
+      '--audio-format', 'mp3',
+      '-o', tmpTemplate,
+      cleanUrl
+    );
+  } else {
+    downloadExtraArgs.push(
+      '-f', `bv*[height<=?${height}]+ba/b`,
+      '--merge-output-format', 'mp4',
+      '-o', tmpTemplate,
+      cleanUrl
+    );
+  }
+
+  const cookiesPath = getCookiesPath();
+  const result = await runWithBotBypass(downloadExtraArgs, cookiesPath);
+
+  if (result.code !== 0) {
+    const parsedErr = parseYtdlpError(result.stderr);
+    return res.status(422).json({ success: false, ...parsedErr });
+  }
+
+  const tmpDir = os.tmpdir();
+  let matchingFiles = [];
+  try {
+    matchingFiles = fs.readdirSync(tmpDir).filter(f => f.startsWith(fileId) && !f.endsWith('.part') && !f.endsWith('.ytdl'));
+  } catch {}
+
+  if (matchingFiles.length === 0) {
+    return res.status(500).json({ success: false, code: 'OUTPUT_MISSING', message: 'Download completed but output missing.' });
+  }
+
+  const actualFilePath = path.join(tmpDir, matchingFiles[0]);
+  const stat = fs.statSync(actualFilePath);
+
+  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+  res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+  res.setHeader('Content-Length', stat.size);
+
+  const readStream = fs.createReadStream(actualFilePath);
+  readStream.pipe(res);
+  const cleanup = () => { fs.unlink(actualFilePath, () => {}); };
+  readStream.on('close', cleanup);
+  readStream.on('error', cleanup);
+});
+
 // ─── /api/download ────────────────────────────────────────────
 app.get('/api/download', async (req, res) => {
   const { url: rawUrl, format, filename, type, audioQuality } = req.query;
