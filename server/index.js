@@ -394,25 +394,40 @@ async function runWithBotBypass(extraArgs, cookiesPath) {
  * Tries with cookies first, then cookies-from-browser as fallback.
  */
 async function runInstagram(extraArgs, cookiesPath) {
-  const baseArgs = buildInstagramArgs(cookiesPath);
-  console.log('[INSTAGRAM] Trying with cookies...');
-  const result = await runYtdlp([...baseArgs, ...extraArgs]);
-  if (result.code === 0) {
-    console.log('[INSTAGRAM] Success with cookies.');
-    return result;
+  // Attempt 1: cookie file
+  if (cookiesPath) {
+    const args = buildInstagramArgs(cookiesPath);
+    console.log('[INSTAGRAM] Trying with cookie file...');
+    const r = await runYtdlp([...args, ...extraArgs]);
+    if (r.code === 0) { console.log('[INSTAGRAM] Success with cookie file.'); return r; }
+    console.warn('[INSTAGRAM] Cookie file failed:', r.stderr.trim().slice(0, 200));
   }
-  console.warn('[INSTAGRAM] Cookies failed:', result.stderr.trim().slice(0, 150));
 
-  // Fallback: try with no cookies (public content)
+  // Attempt 2: read cookies directly from installed browsers
+  for (const browser of ['chrome', 'edge', 'brave', 'chromium']) {
+    const args = [
+      '--no-playlist', '--no-warnings',
+      '--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+      '--add-header', 'Origin:https://www.instagram.com',
+      '--add-header', 'Referer:https://www.instagram.com/',
+      '--cookies-from-browser', browser,
+      '--socket-timeout', '30', '--retries', '3',
+      '--geo-bypass', '--no-check-certificates',
+    ];
+    console.log('[INSTAGRAM] Trying cookies-from-browser ' + browser + '...');
+    const r = await runYtdlp([...args, ...extraArgs]);
+    if (r.code === 0) { console.log('[INSTAGRAM] Success via ' + browser + ' browser.'); return r; }
+    if (/could not find|not installed|Could not copy/i.test(r.stderr)) continue;
+    console.warn('[INSTAGRAM] ' + browser + ' failed:', r.stderr.trim().slice(0, 150));
+  }
+
+  // Attempt 3: no cookies (public posts only)
   const noAuthArgs = buildInstagramArgs(null);
   console.log('[INSTAGRAM] Trying without cookies...');
-  const result2 = await runYtdlp([...noAuthArgs, ...extraArgs]);
-  if (result2.code === 0) {
-    console.log('[INSTAGRAM] Success without cookies.');
-    return result2;
-  }
-  console.warn('[INSTAGRAM] No-cookies also failed:', result2.stderr.trim().slice(0, 150));
-  return result2;
+  const r3 = await runYtdlp([...noAuthArgs, ...extraArgs]);
+  if (r3.code === 0) { console.log('[INSTAGRAM] Success without cookies.'); return r3; }
+  console.warn('[INSTAGRAM] All attempts failed:', r3.stderr.trim().slice(0, 150));
+  return r3;
 }
 
 // ─── Health Check ─────────────────────────────────────────────
